@@ -34,6 +34,7 @@
 #include "knowhere/prometheus_client.h"
 #include "knowhere/sparse_utils.h"
 #include "knowhere/utils.h"
+#include "simd/cache_info.h"
 #include "simd/instruction_set.h"
 #include "simd/sparse_simd.h"
 
@@ -958,18 +959,47 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         return *pos;
     }
 
+    // Default window size for cache-friendly processing (SINDI Window Switch strategy).
+    // Used as fallback when cache detection fails.
+    static constexpr size_t kDefaultWindowSize = 100000;
+
+    // Threshold for using windowed processing - only beneficial for large datasets.
+    // Below this threshold, the overhead of window management outweighs cache benefits.
+    static constexpr size_t kWindowedProcessingThreshold = 200000;
+
+    // Returns optimal window size based on detected CPU cache size.
+    // Uses ~50% of L3 cache for the scores array, leaving room for posting lists.
+    static size_t
+    GetOptimalWindowSize() {
+        static const size_t optimal_size = []() {
+            size_t size = CacheInfo::GetInstance().RecommendedWindowSize();
+            // Clamp to reasonable bounds: min 50K, max 2M elements
+            constexpr size_t kMinWindowSize = 50000;
+            constexpr size_t kMaxWindowSize = 2000000;
+            return std::max(kMinWindowSize, std::min(kMaxWindowSize, size));
+        }();
+        return optimal_size;
+    }
+
     std::vector<float>
     compute_all_distances(const std::vector<std::pair<size_t, DType>>& q_vec,
                           const DocValueComputer<float>& computer) const {
         std::vector<float> scores(n_rows_internal_, 0.0f);
 
         if (metric_type_ == SparseMetricType::METRIC_IP) {
-            for (const auto& [dim_idx, q_weight] : q_vec) {
-                const auto& plist_ids = inverted_index_ids_spans_[dim_idx];
-                const auto& plist_vals = inverted_index_vals_spans_[dim_idx];
+            // Use Window Switch strategy for large datasets to improve cache locality.
+            // For small datasets, the overhead of binary searches is not worth it.
+            if (n_rows_internal_ >= kWindowedProcessingThreshold) {
+                compute_all_distances_windowed_ip(q_vec, scores);
+            } else {
+                for (const auto& [dim_idx, q_weight] : q_vec) {
+                    const auto& plist_ids = inverted_index_ids_spans_[dim_idx];
+                    const auto& plist_vals = inverted_index_vals_spans_[dim_idx];
 
-                accumulate_posting_list_contribution_ip_dispatch<QType>(
-                    plist_ids.data(), plist_vals.data(), plist_ids.size(), static_cast<float>(q_weight), scores.data());
+                    accumulate_posting_list_contribution_ip_dispatch<QType>(
+                        plist_ids.data(), plist_vals.data(), plist_ids.size(), static_cast<float>(q_weight),
+                        scores.data());
+                }
             }
         } else {
             const auto& doc_len_ratios = bm25_params_->row_sums_spans_;
@@ -986,6 +1016,68 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
 
         return scores;
+    }
+
+    // Window Switch strategy for IP metric: process posting lists in windows for better cache locality.
+    // Instead of writing to random locations across the entire scores array (potentially millions of entries),
+    // we process documents in fixed-size windows so writes are concentrated in a cache-friendly region.
+    // Reference: SINDI paper (VLDB 2026) - Section on cache-aware processing.
+    void
+    compute_all_distances_windowed_ip(const std::vector<std::pair<size_t, DType>>& q_vec,
+                                      std::vector<float>& scores) const {
+        const size_t window_size = GetOptimalWindowSize();
+        const size_t num_windows = (n_rows_internal_ + window_size - 1) / window_size;
+
+        // Pre-compute starting positions for each posting list (all start at 0)
+        std::vector<size_t> plist_positions(q_vec.size(), 0);
+
+        for (size_t w = 0; w < num_windows; ++w) {
+            const uint32_t window_start = static_cast<uint32_t>(w * window_size);
+            const uint32_t window_end = static_cast<uint32_t>(std::min((w + 1) * window_size, n_rows_internal_));
+
+            // Process each query term's posting list for this window
+            for (size_t q_idx = 0; q_idx < q_vec.size(); ++q_idx) {
+                const auto& [dim_idx, q_weight] = q_vec[q_idx];
+                const auto& plist_ids = inverted_index_ids_spans_[dim_idx];
+                const auto& plist_vals = inverted_index_vals_spans_[dim_idx];
+
+                if (plist_ids.empty()) {
+                    continue;
+                }
+
+                // Find the range of posting list entries that fall within this window.
+                // Posting lists are sorted by doc_id, so we can use binary search.
+                // Start from where we left off in the previous window (plist_positions[q_idx]).
+                size_t start_pos = plist_positions[q_idx];
+
+                // Skip if we've already processed all entries in this posting list
+                if (start_pos >= plist_ids.size()) {
+                    continue;
+                }
+
+                // Find the first entry >= window_start (should already be at or after start_pos)
+                // Since posting lists are sorted and we process windows in order, start_pos should be correct
+                while (start_pos < plist_ids.size() && plist_ids[start_pos] < window_start) {
+                    ++start_pos;
+                }
+
+                // Find the first entry >= window_end
+                size_t end_pos = start_pos;
+                while (end_pos < plist_ids.size() && plist_ids[end_pos] < window_end) {
+                    ++end_pos;
+                }
+
+                // Process entries in [start_pos, end_pos)
+                if (end_pos > start_pos) {
+                    accumulate_posting_list_contribution_ip_dispatch<QType>(
+                        plist_ids.data() + start_pos, plist_vals.data() + start_pos, end_pos - start_pos,
+                        static_cast<float>(q_weight), scores.data());
+                }
+
+                // Update position for next window
+                plist_positions[q_idx] = end_pos;
+            }
+        }
     }
 
     template <typename DocIdFilter>
