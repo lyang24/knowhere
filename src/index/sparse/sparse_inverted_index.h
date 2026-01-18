@@ -1307,11 +1307,30 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     inline void
     add_row_to_index(const SparseRow<DType>& row, table_t vec_id) {
         [[maybe_unused]] float row_sum = 0;
+        constexpr bool is_wand_or_maxscore =
+            (algo == InvertedIndexAlgo::DAAT_WAND || algo == InvertedIndexAlgo::DAAT_MAXSCORE);
+
+        // For BM25 with WAND/MAXSCORE, pre-compute row_sum in a cheap loop first.
+        // This allows us to merge the max_score update into the main loop below,
+        // eliminating a redundant hash lookup per dimension.
+        if constexpr (is_wand_or_maxscore) {
+            if (metric_type_ == SparseMetricType::METRIC_BM25) {
+                for (size_t j = 0; j < row.size(); ++j) {
+                    row_sum += row[j].val;
+                }
+            }
+        }
+
         for (size_t j = 0; j < row.size(); ++j) {
             auto [dim, val] = row[j];
-            if (metric_type_ == SparseMetricType::METRIC_BM25) {
-                row_sum += val;
+
+            // For non-WAND/MAXSCORE BM25, accumulate row_sum in this loop
+            if constexpr (!is_wand_or_maxscore) {
+                if (metric_type_ == SparseMetricType::METRIC_BM25) {
+                    row_sum += val;
+                }
             }
+
             // Skip values equals to or close enough to zero(which contributes
             // little to the total IP score).
             if (val == 0) {
@@ -1325,34 +1344,26 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 dim_it = dim_map_.insert({dim, next_dim_id_++}).first;
                 inverted_index_ids_.emplace_back();
                 inverted_index_vals_.emplace_back();
-                if constexpr (algo == InvertedIndexAlgo::DAAT_WAND || algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
+                if constexpr (is_wand_or_maxscore) {
                     max_score_in_dim_.emplace_back(0.0f);
                 }
             }
-            inverted_index_ids_[dim_it->second].emplace_back(vec_id);
-            inverted_index_vals_[dim_it->second].emplace_back(get_quant_val(val));
-        }
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-        build_stats_.dataset_nnz_stats_.push_back(row.size());
-#endif
-        // update max_score_in_dim_
-        if constexpr (algo == InvertedIndexAlgo::DAAT_WAND || algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
-            for (size_t j = 0; j < row.size(); ++j) {
-                auto [dim, val] = row[j];
-                if (val == 0) {
-                    continue;
-                }
-                auto dim_it = dim_map_.find(dim);
-                if (dim_it == dim_map_.cend()) {
-                    throw std::runtime_error("unexpected vector dimension in InvertedIndex");
-                }
+            auto dim_id = dim_it->second;
+            inverted_index_ids_[dim_id].emplace_back(vec_id);
+            inverted_index_vals_[dim_id].emplace_back(get_quant_val(val));
+
+            // Update max_score_in_dim_ in the same loop (merged from separate loop)
+            if constexpr (is_wand_or_maxscore) {
                 auto score = static_cast<float>(val);
                 if (metric_type_ == SparseMetricType::METRIC_BM25) {
                     score = bm25_params_->max_score_computer(val, row_sum);
                 }
-                max_score_in_dim_[dim_it->second] = std::max(max_score_in_dim_[dim_it->second], score);
+                max_score_in_dim_[dim_id] = std::max(max_score_in_dim_[dim_id], score);
             }
         }
+#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+        build_stats_.dataset_nnz_stats_.push_back(row.size());
+#endif
         if (metric_type_ == SparseMetricType::METRIC_BM25) {
             bm25_params_->row_sums.emplace_back(row_sum);
         }
