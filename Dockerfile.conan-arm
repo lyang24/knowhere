@@ -1,0 +1,39 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    g++ \
+    gcc \
+    python3 \
+    python3-pip \
+    git \
+    libopenblas-dev \
+    libcurl4-openssl-dev \
+    libaio-dev \
+    libevent-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install conan==1.61.0
+
+WORKDIR /workspace
+COPY . /workspace
+
+# Print system info
+RUN echo "=== System Info ===" && \
+    uname -m && \
+    gcc --version | head -1 && \
+    cmake --version | head -1 && \
+    conan --version
+
+# Simulate Jenkins Conan build
+CMD ["sh", "-c", "\
+    mkdir -p build && cd build && \
+    echo '=== Conan Install ===' && \
+    conan install .. --build=missing -o with_diskann=True -s compiler.libcxx=libstdc++11 -s build_type=Release 2>&1 | tail -20 && \
+    echo '=== CMAKE_SYSTEM_PROCESSOR check ===' && \
+    grep -i 'sparse.*simd\|CMAKE_SYSTEM_PROCESSOR' CMakeCache.txt 2>/dev/null || echo 'CMakeCache.txt not found yet' && \
+    echo '=== Conan Build ===' && \
+    conan build .. 2>&1 | grep -A 5 -B 5 'sparse\|error:' | head -50 || echo 'Build output filtered' \
+"]

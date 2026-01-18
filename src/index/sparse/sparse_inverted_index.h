@@ -964,7 +964,17 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         std::vector<float> scores(n_rows_internal_, 0.0f);
 
         if (metric_type_ == SparseMetricType::METRIC_IP) {
-            for (const auto& [dim_idx, q_weight] : q_vec) {
+            for (size_t i = 0; i < q_vec.size(); ++i) {
+                // Prefetch next term's posting list data while processing current term.
+                // This hides memory latency by overlapping data fetch with computation.
+                if (i + 1 < q_vec.size()) {
+                    auto next_dim = q_vec[i + 1].first;
+                    // Prefetch for read (0), high temporal locality (3) - keep in all cache levels
+                    __builtin_prefetch(inverted_index_ids_spans_[next_dim].data(), 0, 3);
+                    __builtin_prefetch(inverted_index_vals_spans_[next_dim].data(), 0, 3);
+                }
+
+                const auto& [dim_idx, q_weight] = q_vec[i];
                 const auto& plist_ids = inverted_index_ids_spans_[dim_idx];
                 const auto& plist_vals = inverted_index_vals_spans_[dim_idx];
 
@@ -973,7 +983,15 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             }
         } else {
             const auto& doc_len_ratios = bm25_params_->row_sums_spans_;
-            for (const auto& [dim_idx, q_weight] : q_vec) {
+            for (size_t i = 0; i < q_vec.size(); ++i) {
+                // Prefetch next term's posting list data while processing current term.
+                if (i + 1 < q_vec.size()) {
+                    auto next_dim = q_vec[i + 1].first;
+                    __builtin_prefetch(inverted_index_ids_spans_[next_dim].data(), 0, 3);
+                    __builtin_prefetch(inverted_index_vals_spans_[next_dim].data(), 0, 3);
+                }
+
+                const auto& [dim_idx, q_weight] = q_vec[i];
                 const auto& plist_ids = inverted_index_ids_spans_[dim_idx];
                 const auto& plist_vals = inverted_index_vals_spans_[dim_idx];
                 const float q_weight_float = static_cast<float>(q_weight);

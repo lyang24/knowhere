@@ -1,0 +1,26 @@
+# Standalone Makefile for prefetch optimization benchmark
+# Usage: make -f Makefile.prefetch
+#
+# This benchmark compares compute_all_distances with and without prefetching.
+# Self-contained: no external dependencies required.
+
+CXX ?= g++
+CXXFLAGS = -std=c++17 -O3 -Wall -mavx512f -mavx512dq
+LDFLAGS = -pthread
+
+BENCHMARK_BIN = benchmark_prefetch_standalone
+
+all: $(BENCHMARK_BIN)
+
+$(BENCHMARK_BIN): benchmark_prefetch.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+run: $(BENCHMARK_BIN)
+	@echo "Running prefetch optimization benchmark..."
+	@echo ""
+	@./$(BENCHMARK_BIN)
+
+clean:
+	rm -f $(BENCHMARK_BIN)
+
+.PHONY: all run clean

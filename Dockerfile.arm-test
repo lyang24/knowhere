@@ -1,0 +1,23 @@
+FROM ubuntu:22.04
+
+# Simulate Jenkins ARM build environment
+RUN apt-get update && apt-get install -y \
+    cmake \
+    g++ \
+    gcc \
+    python3 \
+    python3-pip \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install conan
+RUN pip3 install conan==1.61.0
+
+WORKDIR /workspace
+COPY . /workspace
+
+# Print architecture
+RUN uname -m && gcc --version
+
+# Try to configure with CMake
+CMD ["sh", "-c", "mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && echo '=== CMake succeeded ===' || echo '=== CMake failed ==='"]
