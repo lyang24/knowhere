@@ -24,12 +24,10 @@ namespace knowhere::sparse {
 // Accumulates contributions from a single posting list for IP metric
 // scores[doc_ids[i]] += q_weight * doc_vals[i] for all i in [0, list_size)
 //
-// TODO: Future optimization - pipelined gathers
-// Moving gathers earlier (gather0, gather1, then compute0, scatter0, compute1, scatter1)
-// could hide ~15-20 cycle gather latency and provide 1.3-1.5x speedup.
-// However, this is only safe when doc_ids are unique within the 32-element window.
-// For single-term posting lists this is guaranteed (each doc appears once per term),
-// but would need conflict detection (AVX512CD) for multi-term fusion scenarios.
+// Uses pipelined gathers to hide ~15-20 cycle gather latency:
+// gather0 -> gather1 -> compute0 -> scatter0 -> compute1 -> scatter1
+// This is safe because doc_ids are unique within a single posting list
+// (each document appears at most once per term).
 void
 accumulate_posting_list_ip_avx512(const uint32_t* doc_ids, const float* doc_vals, size_t list_size, float q_weight,
                                   float* scores) {
@@ -39,23 +37,23 @@ accumulate_posting_list_ip_avx512(const uint32_t* doc_ids, const float* doc_vals
     // Broadcast q_weight to all 16 lanes once before the loops
     __m512 q_weight_vec = _mm512_set1_ps(q_weight);
 
-    // 2x unrolled SIMD loop to hide gather/scatter latency
+    // 2x unrolled SIMD loop with pipelined gathers to hide latency
     for (; j + 2 * SIMD_WIDTH <= list_size; j += 2 * SIMD_WIDTH) {
-        // Chunk 0: elements [j, j+16)
+        // Load values and doc_ids for both chunks
         __m512 vals0 = _mm512_loadu_ps(&doc_vals[j]);
         __m512i doc_ids0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(&doc_ids[j]));
-
-        // Chunk 1: elements [j+16, j+32)
         __m512 vals1 = _mm512_loadu_ps(&doc_vals[j + SIMD_WIDTH]);
         __m512i doc_ids1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(&doc_ids[j + SIMD_WIDTH]));
 
-        // Process chunk 0: new_score = current_score + val * q_weight (FMA)
+        // Issue both gathers early - they can execute in parallel while waiting
         __m512 current_scores0 = _mm512_i32gather_ps(doc_ids0, scores, sizeof(float));
+        __m512 current_scores1 = _mm512_i32gather_ps(doc_ids1, scores, sizeof(float));
+
+        // Process chunk 0: by now gather0 result is ready
         __m512 new_scores0 = _mm512_fmadd_ps(vals0, q_weight_vec, current_scores0);
         _mm512_i32scatter_ps(scores, doc_ids0, new_scores0, sizeof(float));
 
-        // Process chunk 1: new_score = current_score + val * q_weight (FMA)
-        __m512 current_scores1 = _mm512_i32gather_ps(doc_ids1, scores, sizeof(float));
+        // Process chunk 1: gather1 result has been ready
         __m512 new_scores1 = _mm512_fmadd_ps(vals1, q_weight_vec, current_scores1);
         _mm512_i32scatter_ps(scores, doc_ids1, new_scores1, sizeof(float));
     }
