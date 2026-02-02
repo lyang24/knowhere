@@ -1358,96 +1358,148 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    // MaxScore v2: SIMD-optimized MaxScore with accelerated seek operations
-    // Uses SIMDCursor with SIMD parallel comparison for faster posting list traversal
+    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation
+    // Inspired by Turbopuffer's approach: process each posting list's contributions in batches
+    // rather than alternating between iterators. This enables:
+    // - Better memory locality (prefetcher works on sequential access)
+    // - Better branch prediction (consistent pattern per posting list)
+    // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
+        // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
+        constexpr size_t WINDOW_SIZE = 65536;
+
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
         });
 
-        // Use SIMD cursors for accelerated seek
-        std::vector<SIMDCursor<DocIdFilter>> cursors = make_simd_cursors(q_vec, computer, filter, dim_max_score_ratio);
+        // Build posting list info for each query term
+        struct PostingListInfo {
+            float q_weight;
+            float max_score;
+            boost::span<const table_t> ids;
+            boost::span<const QType> vals;
+        };
+        std::vector<PostingListInfo> posting_lists;
+        posting_lists.reserve(q_vec.size());
+
+        for (auto& [inner_dim, q_weight] : q_vec) {
+            auto plist_ids = inverted_index_ids_spans_[inner_dim];
+            auto plist_vals = inverted_index_vals_spans_[inner_dim];
+            if (plist_ids.empty())
+                continue;
+
+            float max_score = max_score_in_dim_spans_[inner_dim] * static_cast<float>(q_weight) * dim_max_score_ratio;
+            posting_lists.push_back({static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
+        }
+
+        if (posting_lists.empty())
+            return;
+
+        // Compute suffix sums for pruning (upper bounds)
+        std::vector<float> upper_bounds(posting_lists.size());
+        float bound_sum = 0.0f;
+        for (size_t i = posting_lists.size(); i > 0; --i) {
+            bound_sum += posting_lists[i - 1].max_score;
+            upper_bounds[i - 1] = bound_sum;
+        }
 
         float threshold = heap.full() ? heap.top().val : 0;
 
-        // Compute cumulative upper bounds (suffix sums)
-        std::vector<float> upper_bounds(cursors.size());
-        float bound_sum = 0.0;
-        for (size_t i = cursors.size() - 1; i + 1 > 0; --i) {
-            bound_sum += cursors[i].max_score_;
-            upper_bounds[i] = bound_sum;
-        }
+        // Allocate window score buffer (aligned for SIMD)
+        sparse::AlignedVector<float> scores(WINDOW_SIZE);
 
-        table_t next_cand_vec_id = n_rows_internal_;
-        for (size_t i = 0; i < cursors.size(); ++i) {
-            if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
-                next_cand_vec_id = cursors[i].cur_vec_id_;
+        // Track current position in each posting list (for cursor advancement across windows)
+        std::vector<size_t> cursors(posting_lists.size(), 0);
+
+        // Process documents in windows
+        for (table_t window_start = 0; window_start < n_rows_internal_; window_start += WINDOW_SIZE) {
+            table_t window_end =
+                std::min(static_cast<table_t>(window_start + WINDOW_SIZE), static_cast<table_t>(n_rows_internal_));
+            size_t window_size = window_end - window_start;
+
+            // Reset scores for this window
+            std::memset(scores.data(), 0, window_size * sizeof(float));
+
+            // Find essential/non-essential split based on current threshold
+            size_t first_ne_idx = posting_lists.size();
+            while (first_ne_idx > 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
+                --first_ne_idx;
             }
-        }
+            if (first_ne_idx == 0)
+                break;  // No more candidates possible
 
-        // first_ne_idx is the index of the first non-essential cursor
-        size_t first_ne_idx = cursors.size();
+            // BATCH PROCESS each essential posting list
+            // This is the key insight from Turbopuffer: process all contributions from one
+            // posting list before moving to the next, enabling CPU prefetcher and SIMD
+            for (size_t i = 0; i < first_ne_idx; ++i) {
+                auto& pl = posting_lists[i];
+                const table_t* ids = pl.ids.data();
+                const QType* vals = pl.vals.data();
+                size_t pl_size = pl.ids.size();
 
-        while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
-            --first_ne_idx;
-            if (first_ne_idx == 0) {
-                return;
-            }
-        }
-
-        float curr_cand_score = 0.0f;
-        table_t curr_cand_vec_id = 0;
-
-        while (curr_cand_vec_id < n_rows_internal_) {
-            auto found_cand = false;
-            while (found_cand == false) {
-                if (next_cand_vec_id >= n_rows_internal_) {
-                    return;
+                // Advance cursor to first element >= window_start
+                while (cursors[i] < pl_size && ids[cursors[i]] < window_start) {
+                    cursors[i]++;
                 }
-                curr_cand_vec_id = next_cand_vec_id;
-                curr_cand_score = 0.0f;
-                next_cand_vec_id = n_rows_internal_;
+                size_t list_start = cursors[i];
+
+                // Find end position (first element >= window_end)
+                size_t list_end = list_start;
+                while (list_end < pl_size && ids[list_end] < window_end) {
+                    list_end++;
+                }
+
+                if (list_start < list_end) {
+                    // SIMD batch accumulate to window-relative scores buffer
+                    // scores[doc_id - window_start] += q_weight * val
+                    sparse::accumulate_window_ip_dispatch(ids, vals, list_start, list_end, pl.q_weight, scores.data(),
+                                                          window_start);
+                }
+            }
+
+            // Extract candidates from scores array
+            // For candidates above threshold, compute full score with non-essential terms
+            for (size_t doc_offset = 0; doc_offset < window_size; ++doc_offset) {
+                float score = scores[doc_offset];
+                if (score <= threshold)
+                    continue;
+
+                table_t doc_id = window_start + static_cast<table_t>(doc_offset);
+                if (filter(doc_id))
+                    continue;
+
+                // Add contributions from non-essential terms
+                // (These are terms whose max contribution alone can't beat threshold,
+                // but might contribute when combined with essential terms)
+                float full_score = score;
                 float cur_vec_sum =
-                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[curr_cand_vec_id] : 0;
+                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
 
-                // Process essential terms
-                for (size_t i = 0; i < first_ne_idx; ++i) {
-                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
-                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
-                        cursors[i].next();
-                    }
-                    if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
-                        next_cand_vec_id = cursors[i].cur_vec_id_;
-                    }
-                }
-
-                // Check non-essential terms with SIMD-accelerated seek
-                found_cand = true;
-                for (size_t i = first_ne_idx; i < cursors.size(); ++i) {
-                    if (curr_cand_score + upper_bounds[i] <= threshold) {
-                        found_cand = false;
+                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                    // Early termination if we can't beat threshold
+                    if (full_score + upper_bounds[i] <= threshold)
                         break;
-                    }
-                    // SIMD seek is used here (inside SIMDCursor::seek)
-                    cursors[i].seek(curr_cand_vec_id);
-                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
-                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
+
+                    auto& pl = posting_lists[i];
+                    const table_t* ids = pl.ids.data();
+                    const QType* vals = pl.vals.data();
+                    size_t pl_size = pl.ids.size();
+
+                    // Binary search for doc_id in this posting list
+                    auto it = std::lower_bound(ids, ids + pl_size, doc_id);
+                    if (it != ids + pl_size && *it == doc_id) {
+                        size_t idx = it - ids;
+                        full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
                     }
                 }
-            }
 
-            if (curr_cand_score > threshold) {
-                heap.push(curr_cand_vec_id, curr_cand_score);
-                threshold = heap.full() ? heap.top().val : 0;
-                while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
-                    --first_ne_idx;
-                    if (first_ne_idx == 0) {
-                        return;
-                    }
+                if (full_score > threshold) {
+                    heap.push(doc_id, full_score);
+                    threshold = heap.full() ? heap.top().val : 0;
                 }
             }
         }
