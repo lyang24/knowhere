@@ -18,9 +18,7 @@
 #include <memory>
 #include <vector>
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
+#include "simd/sparse_simd.h"
 
 namespace knowhere::sparse {
 
@@ -183,120 +181,11 @@ struct SIMDPostingList {
 // SIMD-Accelerated Operations
 // =============================================================================
 
-// Scalar seek: baseline implementation
-inline size_t
-scalar_seek(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
-    for (size_t pos = start_pos; pos < size; pos++) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-    }
-    return size;
-}
-
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-
-// SIMD seek: find first position where id >= target
-// Returns position or size if not found
-// Requires: ids array is sorted and padded to AVX512_WIDTH
-inline size_t
-simd_seek_avx512(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
-    // Skip to aligned position
-    size_t pos = start_pos;
-
-    // Scalar until aligned or found
-    while (pos < size && (reinterpret_cast<uintptr_t>(&ids[pos]) % SIMD_ALIGNMENT) != 0) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-        pos++;
-    }
-
-    // SIMD search
-    __m512i target_vec = _mm512_set1_epi32(static_cast<int32_t>(target));
-
-    while (pos + AVX512_WIDTH <= size) {
-        __m512i id_vec = _mm512_load_si512(reinterpret_cast<const __m512i*>(&ids[pos]));
-        // Compare: mask where id >= target (equivalent to !(id < target))
-        __mmask16 ge_mask = _mm512_cmpge_epi32_mask(id_vec, target_vec);
-
-        if (ge_mask != 0) {
-            // Found at least one match, return first position
-            return pos + __builtin_ctz(ge_mask);
-        }
-        pos += AVX512_WIDTH;
-    }
-
-    // Scalar tail
-    while (pos < size) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-        pos++;
-    }
-
-    return size;  // Not found
-}
-
-#endif  // AVX512F && AVX512DQ
-
-#if defined(__AVX2__)
-
-// AVX2 seek implementation
-inline size_t
-simd_seek_avx2(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
-    size_t pos = start_pos;
-
-    // Scalar until aligned
-    while (pos < size && (reinterpret_cast<uintptr_t>(&ids[pos]) % 32) != 0) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-        pos++;
-    }
-
-    __m256i target_vec = _mm256_set1_epi32(static_cast<int32_t>(target));
-
-    while (pos + AVX2_WIDTH <= size) {
-        __m256i id_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&ids[pos]));
-        // For AVX2: use _mm256_cmpgt_epi32 and handle equality separately
-        // id >= target is equivalent to !(target > id)
-        __m256i gt_mask = _mm256_cmpgt_epi32(target_vec, id_vec);  // target > id
-        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(gt_mask));
-
-        if (mask != 0xFF) {
-            // At least one element where !(target > id), i.e., id >= target
-            // Find first position where id >= target
-            int not_mask = ~mask & 0xFF;
-            return pos + __builtin_ctz(not_mask);
-        }
-        pos += AVX2_WIDTH;
-    }
-
-    // Scalar tail
-    while (pos < size) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-        pos++;
-    }
-
-    return size;
-}
-
-#endif  // AVX2
-
-// Dispatch function for SIMD seek
-// Uses compile-time detection - the actual SIMD version depends on compiler flags
+// Dispatch function for SIMD seek with runtime CPU detection
+// Uses AVX2 SIMD seek on supported CPUs, scalar fallback otherwise
 inline size_t
 simd_seek(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
-    return simd_seek_avx512(ids, size, start_pos, target);
-#elif defined(__AVX2__)
-    return simd_seek_avx2(ids, size, start_pos, target);
-#else
-    return scalar_seek(ids, size, start_pos, target);
-#endif
+    return simd_seek_dispatch(ids, size, start_pos, target);
 }
 
 // =============================================================================
