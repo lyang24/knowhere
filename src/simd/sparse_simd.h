@@ -15,7 +15,11 @@ void
 accumulate_posting_list_ip_avx512(const uint32_t* doc_ids, const float* doc_vals, size_t list_size, float q_weight,
                                   float* scores);
 
-// AVX2 SIMD seek: find first position where id >= target
+// AVX512 SIMD seek: find first position where id >= target (16-wide)
+size_t
+simd_seek_avx512_impl(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target);
+
+// AVX2 SIMD seek: find first position where id >= target (8-wide)
 size_t
 simd_seek_avx2_impl(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target);
 #endif
@@ -31,12 +35,25 @@ scalar_seek_impl(const uint32_t* __restrict__ ids, size_t size, size_t start_pos
     return size;
 }
 
+// Minimum remaining elements to use SIMD seek (threshold)
+// For small seeks, scalar is faster due to SIMD setup overhead
+constexpr size_t SIMD_SEEK_THRESHOLD = 64;
+
 // Dispatch function for SIMD seek with runtime CPU detection
+// Only uses SIMD when there are enough remaining elements to amortize setup cost
 inline size_t
 simd_seek_dispatch(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
+    size_t remaining = size - start_pos;
+
 #if defined(__x86_64__) || defined(_M_X64)
-    if (faiss::InstructionSet::GetInstance().AVX2()) {
-        return simd_seek_avx2_impl(ids, size, start_pos, target);
+    // Only use SIMD for larger seeks where setup overhead is amortized
+    if (remaining >= SIMD_SEEK_THRESHOLD) {
+        if (faiss::InstructionSet::GetInstance().AVX512F()) {
+            return simd_seek_avx512_impl(ids, size, start_pos, target);
+        }
+        if (faiss::InstructionSet::GetInstance().AVX2()) {
+            return simd_seek_avx2_impl(ids, size, start_pos, target);
+        }
     }
 #endif
     return scalar_seek_impl(ids, size, start_pos, target);
