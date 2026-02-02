@@ -183,7 +183,18 @@ struct SIMDPostingList {
 // SIMD-Accelerated Operations
 // =============================================================================
 
-#if defined(__x86_64__) || defined(_M_X64)
+// Scalar seek: baseline implementation
+inline size_t
+scalar_seek(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
+    for (size_t pos = start_pos; pos < size; pos++) {
+        if (ids[pos] >= target) {
+            return pos;
+        }
+    }
+    return size;
+}
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
 
 // SIMD seek: find first position where id >= target
 // Returns position or size if not found
@@ -227,7 +238,11 @@ simd_seek_avx512(const uint32_t* __restrict__ ids, size_t size, size_t start_pos
     return size;  // Not found
 }
 
-// AVX2 fallback for seek
+#endif  // AVX512F && AVX512DQ
+
+#if defined(__AVX2__)
+
+// AVX2 seek implementation
 inline size_t
 simd_seek_avx2(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
     size_t pos = start_pos;
@@ -269,23 +284,18 @@ simd_seek_avx2(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, 
     return size;
 }
 
-#endif  // x86_64
+#endif  // AVX2
 
 // Dispatch function for SIMD seek
+// Uses compile-time detection - the actual SIMD version depends on compiler flags
 inline size_t
 simd_seek(const uint32_t* __restrict__ ids, size_t size, size_t start_pos, uint32_t target) {
-#if defined(__x86_64__) || defined(_M_X64)
-    // TODO: Add runtime CPU detection
-    // For now, use AVX2 as baseline
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    return simd_seek_avx512(ids, size, start_pos, target);
+#elif defined(__AVX2__)
     return simd_seek_avx2(ids, size, start_pos, target);
 #else
-    // Scalar fallback
-    for (size_t pos = start_pos; pos < size; pos++) {
-        if (ids[pos] >= target) {
-            return pos;
-        }
-    }
-    return size;
+    return scalar_seek(ids, size, start_pos, target);
 #endif
 }
 
