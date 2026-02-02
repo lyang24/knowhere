@@ -159,9 +159,9 @@ void
 print_usage(const char* prog) {
     printf("Usage: %s --data-dir <path> [--topk <k>] [--nq <num_queries>]\n", prog);
     printf("\nExpected files in data-dir:\n");
-    printf("  base_small.csr   - Base vectors in CSR format\n");
-    printf("  queries.dev.csr  - Query vectors in CSR format\n");
-    printf("  base_small.gt    - Ground truth (binary int32)\n");
+    printf("  base_small.csr       - Base vectors in CSR format\n");
+    printf("  queries.dev.csr      - Query vectors in CSR format\n");
+    printf("  base_small.dev.gt    - Ground truth (binary: nq, k header + nq*k int32 IDs)\n");
     printf("\nDownload from:\n");
     printf("  wget https://storage.googleapis.com/ann-challenge-sparse-vectors/csr/base_small.csr.gz\n");
     printf("  wget https://storage.googleapis.com/ann-challenge-sparse-vectors/csr/queries.dev.csr.gz\n");
@@ -218,7 +218,7 @@ main(int argc, char** argv) {
 
     // Load ground truth
     GroundTruth gt;
-    if (!gt.load(data_dir + "/base_small.gt", queries.n_rows)) {
+    if (!gt.load(data_dir + "/base_small.dev.gt", queries.n_rows)) {
         printf("Warning: Ground truth not loaded, recall will not be computed\n");
     }
 
@@ -283,35 +283,43 @@ main(int argc, char** argv) {
         search_conf["drop_ratio_search"] = 0.0f;
         search_conf["topk"] = topk;
 
+        // Pre-allocate reusable query dataset to avoid per-query allocation overhead
+        auto query_ds = knowhere::GenDataSet(1, queries.n_cols, nullptr);
+        query_ds->SetIsSparse(true);
+
         // Run benchmark
         printf("\n[Running Search Benchmark]\n");
         std::vector<double> run_times;
-        std::vector<int64_t> all_results(nq * topk);
-        std::vector<float> all_distances(nq * topk);
+        std::vector<int64_t> all_results(nq * topk, -1);  // Initialize to -1 for invalid detection
+        std::vector<bool> query_success(nq, false);
+        int64_t failed_queries = 0;
 
         for (int run = 0; run < total_runs; ++run) {
             Timer search_timer;
+            failed_queries = 0;
 
             for (int64_t q = 0; q < nq; ++q) {
-                auto query_ds = knowhere::GenDataSet(1, queries.n_cols, nullptr);
-                query_ds->SetIsSparse(true);
                 query_ds->SetTensor(&query_rows[q]);
 
                 auto result = index.Search(query_ds, search_conf, knowhere::BitsetView());
                 if (!result.has_value()) {
-                    printf("Error: Search failed for query %ld\n", q);
+                    failed_queries++;
+                    query_success[q] = false;
                     continue;
                 }
 
+                query_success[q] = true;
                 auto ids = result.value()->GetIds();
-                auto dists = result.value()->GetDistance();
                 memcpy(&all_results[q * topk], ids, topk * sizeof(int64_t));
-                memcpy(&all_distances[q * topk], dists, topk * sizeof(float));
             }
 
             double elapsed = search_timer.elapsed_ms();
             run_times.push_back(elapsed);
-            printf("  Run %d: %.2f ms (%.1f QPS)\n", run + 1, elapsed, nq * 1000.0 / elapsed);
+            printf("  Run %d: %.2f ms (%.1f batch QPS)\n", run + 1, elapsed, nq * 1000.0 / elapsed);
+        }
+
+        if (failed_queries > 0) {
+            printf("  Warning: %ld queries failed in last run\n", failed_queries);
         }
 
         // Calculate average of last (total_runs - warmup_runs) runs
@@ -321,19 +329,26 @@ main(int argc, char** argv) {
         }
         avg_time /= (total_runs - warmup_runs);
 
-        // Compute recall
+        // Compute recall on last run's results (only for successful queries)
         float avg_recall = 0;
+        int64_t valid_queries = 0;
         if (gt.nq > 0) {
             for (int64_t q = 0; q < nq; ++q) {
-                avg_recall += gt.compute_recall(&all_results[q * topk], q, topk);
+                if (query_success[q]) {
+                    avg_recall += gt.compute_recall(&all_results[q * topk], q, topk);
+                    valid_queries++;
+                }
             }
-            avg_recall /= nq;
+            if (valid_queries > 0) {
+                avg_recall /= valid_queries;
+            }
         }
 
         printf("\n[Results for %s]\n", algo.c_str());
-        printf("  Avg search time: %.2f ms\n", avg_time);
-        printf("  QPS: %.1f\n", nq * 1000.0 / avg_time);
-        printf("  Recall@%ld: %.4f (%.2f%%)\n", topk, avg_recall, avg_recall * 100);
+        printf("  Avg search time: %.2f ms (over %d timed runs)\n", avg_time, total_runs - warmup_runs);
+        printf("  Batch QPS: %.1f (nq=%ld)\n", nq * 1000.0 / avg_time, nq);
+        printf("  Recall@%ld: %.4f (%.2f%%) [from last run, %ld/%ld queries]\n", topk, avg_recall, avg_recall * 100,
+               valid_queries, nq);
     }
 
     printf("\n==========================================================\n");
