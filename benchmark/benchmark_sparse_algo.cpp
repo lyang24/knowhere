@@ -23,6 +23,7 @@
 #include "knowhere/bitsetview.h"
 #include "knowhere/comp/knowhere_config.h"
 #include "knowhere/index/index_factory.h"
+#include "knowhere/operands.h"
 #include "knowhere/sparse_utils.h"
 
 // CSR format loader for MSMARCO/SPLADE data from big-ann-benchmarks
@@ -251,7 +252,7 @@ main(int argc, char** argv) {
         printf("\n[Building Index]\n");
         Timer build_timer;
 
-        auto index_result = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        auto index_result = knowhere::IndexFactory::Instance().Create<knowhere::sparse_u32_f32>(
             "SPARSE_INVERTED_INDEX", knowhere::Version::GetCurrentVersion().VersionNumber());
         if (!index_result.has_value()) {
             printf("Error: Failed to create index\n");
