@@ -87,27 +87,26 @@ struct CSRDataset {
     }
 };
 
-// Ground truth loader (binary format: nq x k int32_t)
+// Ground truth loader (binary format: nq, k header then nq x k int32_t)
 struct GroundTruth {
     std::vector<std::vector<int32_t>> gt;
     int64_t nq = 0;
     int64_t k = 0;
 
     bool
-    load(const std::string& path, int64_t expected_nq) {
+    load(const std::string& path, int64_t /*expected_nq*/) {
         std::ifstream file(path, std::ios::binary);
         if (!file) {
             printf("Error: Cannot open ground truth file %s\n", path.c_str());
             return false;
         }
 
-        // Get file size to determine k
-        file.seekg(0, std::ios::end);
-        int64_t file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        nq = expected_nq;
-        k = file_size / (nq * sizeof(int32_t));
+        // Read header: nq and k (both int32_t)
+        int32_t nq32, k32;
+        file.read(reinterpret_cast<char*>(&nq32), sizeof(int32_t));
+        file.read(reinterpret_cast<char*>(&k32), sizeof(int32_t));
+        nq = nq32;
+        k = k32;
         printf("  Loading GT: %ld queries, k=%ld\n", nq, k);
 
         gt.resize(nq);
