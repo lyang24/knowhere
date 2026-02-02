@@ -72,10 +72,6 @@ struct InvertedIndexApproxSearchParams {
     float dim_max_score_ratio;
 };
 
-// Block size for blocked posting list processing in MaxScore v2
-// Chosen to balance cache efficiency and pruning granularity
-constexpr size_t POSTING_LIST_BLOCK_SIZE = 128;
-
 template <typename T>
 class BaseInvertedIndex {
  public:
@@ -1063,119 +1059,6 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     };  // struct Cursor
 
-    // BlockedCursor: Cursor with per-block upper bounds for MaxScore v2
-    // Enables block-level skipping when block_max * query_weight can't contribute enough
-    template <typename DocIdFilter>
-    struct BlockedCursor {
-     public:
-        BlockedCursor(const boost::span<const table_t>& plist_ids, const boost::span<const QType>& plist_vals,
-                      size_t num_vec, float max_score, float q_value, DocIdFilter filter)
-            : plist_ids_(plist_ids),
-              plist_vals_(plist_vals),
-              plist_size_(plist_ids.size()),
-              total_num_vec_(num_vec),
-              max_score_(max_score),
-              q_value_(q_value),
-              filter_(filter) {
-            // Compute per-block max values
-            compute_block_max_scores();
-            skip_filtered_ids();
-            update_cur_vec_id();
-        }
-        BlockedCursor(const BlockedCursor& rhs) = delete;
-        BlockedCursor(BlockedCursor&& rhs) noexcept = default;
-
-        void
-        next() {
-            ++loc_;
-            skip_filtered_ids();
-            update_cur_vec_id();
-        }
-
-        void
-        seek(table_t vec_id) {
-            while (loc_ < plist_size_ && plist_ids_[loc_] < vec_id) {
-                ++loc_;
-            }
-            skip_filtered_ids();
-            update_cur_vec_id();
-        }
-
-        // Skip to next block, returns the first doc_id in that block (or total_num_vec_ if exhausted)
-        void
-        next_block() {
-            size_t cur_block = loc_ / POSTING_LIST_BLOCK_SIZE;
-            loc_ = (cur_block + 1) * POSTING_LIST_BLOCK_SIZE;
-            skip_filtered_ids();
-            update_cur_vec_id();
-        }
-
-        // Get the max score contribution for the current block
-        float
-        cur_block_max_score() const {
-            size_t block_idx = loc_ / POSTING_LIST_BLOCK_SIZE;
-            if (block_idx >= block_max_scores_.size()) {
-                return 0.0f;
-            }
-            return block_max_scores_[block_idx] * q_value_;
-        }
-
-        // Get the first doc_id of the next block (for pivot selection)
-        table_t
-        next_block_first_doc_id() const {
-            size_t cur_block = loc_ / POSTING_LIST_BLOCK_SIZE;
-            size_t next_block_start = (cur_block + 1) * POSTING_LIST_BLOCK_SIZE;
-            if (next_block_start >= plist_size_) {
-                return total_num_vec_;
-            }
-            return plist_ids_[next_block_start];
-        }
-
-        QType
-        cur_vec_val() const {
-            return plist_vals_[loc_];
-        }
-
-        const boost::span<const table_t>& plist_ids_;
-        const boost::span<const QType>& plist_vals_;
-        const size_t plist_size_;
-        size_t loc_ = 0;
-        size_t total_num_vec_ = 0;
-        float max_score_ = 0.0f;  // Global max score for this term
-        float q_value_ = 0.0f;
-        DocIdFilter filter_;
-        table_t cur_vec_id_ = 0;
-        std::vector<float> block_max_scores_;  // Per-block max values
-
-     private:
-        inline void
-        update_cur_vec_id() {
-            cur_vec_id_ = (loc_ >= plist_size_) ? total_num_vec_ : plist_ids_[loc_];
-        }
-
-        inline void
-        skip_filtered_ids() {
-            while (loc_ < plist_size_ && !filter_.empty() && filter_.test(plist_ids_[loc_])) {
-                ++loc_;
-            }
-        }
-
-        void
-        compute_block_max_scores() {
-            if (plist_size_ == 0) {
-                return;
-            }
-            size_t num_blocks = (plist_size_ + POSTING_LIST_BLOCK_SIZE - 1) / POSTING_LIST_BLOCK_SIZE;
-            block_max_scores_.resize(num_blocks, 0.0f);
-
-            for (size_t i = 0; i < plist_size_; ++i) {
-                size_t block_idx = i / POSTING_LIST_BLOCK_SIZE;
-                float val = static_cast<float>(plist_vals_[i]);
-                block_max_scores_[block_idx] = std::max(block_max_scores_[block_idx], val);
-            }
-        }
-    };  // struct BlockedCursor
-
     std::vector<std::pair<size_t, DType>>
     parse_query(const SparseRow<DType>& query, float drop_ratio_search) const {
         DType q_threshold = 0;
@@ -1386,12 +1269,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    // MaxScore v2: Block-based MaxScore with per-block upper bounds (SEISMIC-inspired)
-    // Key optimizations:
-    // 1. Per-block max values: each posting list block has precomputed max value
-    // 2. Block-level skipping: skip entire blocks when block_max * q_weight + remaining <= threshold
-    // 3. Window-based candidate collection for better cache locality
-    // 4. Mass tracking: count matched essential terms per candidate
+    // MaxScore v2: MaxScore with mass pruning
+    // Key optimization: Mass pruning skips candidates that don't have enough essential term matches
+    // to potentially beat the threshold, even with maximum contribution from remaining terms.
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
@@ -1401,73 +1281,46 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
         });
 
-        // Create blocked cursors with per-block max values
-        std::vector<BlockedCursor<DocIdFilter>> cursors;
-        cursors.reserve(q_vec.size());
-        for (auto q_dim : q_vec) {
-            auto& plist_ids = inverted_index_ids_spans_[q_dim.first];
-            auto& plist_vals = inverted_index_vals_spans_[q_dim.first];
-            cursors.emplace_back(plist_ids, plist_vals, n_rows_internal_,
-                                 max_score_in_dim_spans_[q_dim.first] * q_dim.second * dim_max_score_ratio,
-                                 q_dim.second, filter);
-        }
-        const size_t num_terms = cursors.size();
+        // Use simple cursors (same as MaxScore v1)
+        std::vector<Cursor<DocIdFilter>> cursors = make_cursors(q_vec, computer, filter, dim_max_score_ratio);
 
         float threshold = heap.full() ? heap.top().val : 0;
 
         // Compute cumulative upper bounds (suffix sums)
         // upper_bounds[i] = sum of max_score for terms [i, num_terms)
-        std::vector<float> upper_bounds(num_terms);
+        std::vector<float> upper_bounds(cursors.size());
         float bound_sum = 0.0;
-        for (size_t i = num_terms - 1; i + 1 > 0; --i) {
+        for (size_t i = cursors.size() - 1; i + 1 > 0; --i) {
             bound_sum += cursors[i].max_score_;
             upper_bounds[i] = bound_sum;
         }
 
+        table_t next_cand_vec_id = n_rows_internal_;
+        for (size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
+                next_cand_vec_id = cursors[i].cur_vec_id_;
+            }
+        }
+
         // Find first non-essential index: terms [0, first_ne_idx) are essential
         // Non-essential terms alone cannot exceed threshold
-        size_t first_ne_idx = num_terms;
+        size_t first_ne_idx = cursors.size();
         while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
             --first_ne_idx;
-        }
-        if (first_ne_idx == 0) {
-            return;
-        }
-
-        // Window parameters for batch processing
-        constexpr size_t WINDOW_SIZE = 64;
-
-        struct Candidate {
-            table_t doc_id;
-            float score;
-            uint16_t mass;  // uint16_t to handle queries with >255 essential terms
-        };
-        std::vector<Candidate> window;
-        window.reserve(WINDOW_SIZE);
-
-        // Find the minimum doc_id across all essential cursors
-        auto find_next_candidate = [&]() -> table_t {
-            table_t min_id = n_rows_internal_;
-            for (size_t i = 0; i < first_ne_idx; ++i) {
-                if (cursors[i].cur_vec_id_ < min_id) {
-                    min_id = cursors[i].cur_vec_id_;
-                }
+            if (first_ne_idx == 0) {
+                return;
             }
-            return min_id;
-        };
+        }
 
-        // Calculate minimum mass required to potentially beat threshold.
-        // Must account for non-essential terms' contribution to avoid false-negative pruning.
-        // A candidate can still exceed threshold if: essential_score + non_essential_upper_bound > threshold
+        // Lambda to compute minimum mass required to potentially beat threshold
+        // Must account for non-essential terms' contribution to avoid false-negative pruning
         auto compute_min_mass = [&]() -> size_t {
             if (first_ne_idx == 0)
                 return 0;
-            // Non-essential terms can contribute at most upper_bounds[first_ne_idx]
-            float non_essential_upper = (first_ne_idx < num_terms) ? upper_bounds[first_ne_idx] : 0.0f;
+            float non_essential_upper = (first_ne_idx < cursors.size()) ? upper_bounds[first_ne_idx] : 0.0f;
             float accum = 0;
             for (size_t m = 0; m < first_ne_idx; ++m) {
                 accum += cursors[m].max_score_;
-                // Safe bound: candidate can beat threshold if accum + non_essential_upper > threshold
                 if (accum + non_essential_upper > threshold) {
                     return m + 1;
                 }
@@ -1475,88 +1328,61 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             return first_ne_idx;
         };
 
-        while (true) {
-            // Phase 1: Collect a window of candidates from essential terms
-            window.clear();
+        float curr_cand_score = 0.0f;
+        table_t curr_cand_vec_id = 0;
+
+        while (curr_cand_vec_id < n_rows_internal_) {
             size_t min_mass = compute_min_mass();
+            auto found_cand = false;
 
-            while (window.size() < WINDOW_SIZE) {
-                table_t curr_doc_id = find_next_candidate();
-                if (curr_doc_id >= n_rows_internal_) {
-                    break;
+            while (found_cand == false) {
+                if (next_cand_vec_id >= n_rows_internal_) {
+                    return;
                 }
+                curr_cand_vec_id = next_cand_vec_id;
+                curr_cand_score = 0.0f;
+                next_cand_vec_id = n_rows_internal_;
 
-                // Compute partial score from essential terms and track mass
-                float score = 0.0f;
-                uint16_t mass = 0;
                 float cur_vec_sum =
-                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[curr_doc_id] : 0;
+                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[curr_cand_vec_id] : 0;
 
+                // Compute score from essential terms and track mass
+                uint16_t mass = 0;
                 for (size_t i = 0; i < first_ne_idx; ++i) {
-                    if (cursors[i].cur_vec_id_ == curr_doc_id) {
-                        score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
+                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
+                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
                         ++mass;
                         cursors[i].next();
+                    }
+                    if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
+                        next_cand_vec_id = cursors[i].cur_vec_id_;
                     }
                 }
 
                 // Mass pruning: skip if too few essential terms matched
-                if (mass >= min_mass) {
-                    window.push_back({curr_doc_id, score, mass});
+                if (mass < min_mass) {
+                    continue;
                 }
-            }
 
-            if (window.empty()) {
-                break;
-            }
-
-            // Phase 2: Process candidates in window, verify with non-essential terms
-            // Use block-level pruning for non-essential term evaluation
-            for (auto& cand : window) {
-                float score = cand.score;
-                float cur_vec_sum =
-                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[cand.doc_id] : 0;
-
-                // Check non-essential terms with block-level pruning
-                bool should_add = true;
-                for (size_t i = first_ne_idx; i < num_terms; ++i) {
-                    // Early termination: if current score + remaining upper bound <= threshold
-                    if (score + upper_bounds[i] <= threshold) {
-                        should_add = false;
+                // Check non-essential terms (same as MaxScore v1)
+                found_cand = true;
+                for (size_t i = first_ne_idx; i < cursors.size(); ++i) {
+                    if (curr_cand_score + upper_bounds[i] <= threshold) {
+                        found_cand = false;
                         break;
                     }
-
-                    // Block-level pruning: check if current block can contribute enough
-                    // Skip blocks that can't help reach threshold
-                    while (cursors[i].cur_vec_id_ < cand.doc_id) {
-                        // Check if we can skip the current block entirely
-                        float block_contribution = cursors[i].cur_block_max_score();
-                        float potential_score =
-                            score + block_contribution + (i + 1 < num_terms ? upper_bounds[i + 1] : 0);
-
-                        if (potential_score <= threshold && cursors[i].next_block_first_doc_id() <= cand.doc_id) {
-                            // Skip to next block
-                            cursors[i].next_block();
-                        } else {
-                            // Can't skip, use regular seek
-                            cursors[i].seek(cand.doc_id);
-                            break;
-                        }
-                    }
-
-                    if (cursors[i].cur_vec_id_ == cand.doc_id) {
-                        score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
+                    cursors[i].seek(curr_cand_vec_id);
+                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
+                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
                     }
                 }
+            }
 
-                if (should_add && score > threshold) {
-                    heap.push(cand.doc_id, score);
-                    threshold = heap.full() ? heap.top().val : 0;
-
-                    // Update essential/non-essential boundary
-                    while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
-                        --first_ne_idx;
-                    }
+            if (curr_cand_score > threshold) {
+                heap.push(curr_cand_vec_id, curr_cand_score);
+                threshold = heap.full() ? heap.top().val : 0;
+                while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
+                    --first_ne_idx;
                     if (first_ne_idx == 0) {
                         return;
                     }
