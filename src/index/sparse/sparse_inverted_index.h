@@ -1463,11 +1463,16 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 if (list_start < list_end) {
                     if (metric_type_ == SparseMetricType::METRIC_IP) {
                         // SIMD batch accumulate for IP metric
-                        // scores[doc_id - window_start] += q_weight * val
                         sparse::accumulate_window_ip_dispatch(ids, vals, list_start, list_end, pl.q_weight,
                                                               scores.data(), window_start);
+                        // Set bits in candidate bitmap (only for IP - faster iteration)
+                        for (size_t j = list_start; j < list_end; ++j) {
+                            const uint32_t local_id = ids[j] - window_start;
+                            candidate_bitmap[local_id >> 6] |= (1ULL << (local_id & 63));
+                        }
                     } else {
                         // Scalar loop for BM25 metric (requires computer function)
+                        // Skip bitmap for BM25 - linear scan is faster
                         const auto& doc_len_ratios = bm25_params_->row_sums_spans_;
                         for (size_t j = list_start; j < list_end; ++j) {
                             const auto doc_id = ids[j];
@@ -1476,63 +1481,76 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                                 pl.q_weight * computer(static_cast<float>(vals[j]), doc_len_ratios[doc_id]);
                         }
                     }
-
-                    // Set bits in candidate bitmap for docs in this posting list segment
-                    for (size_t j = list_start; j < list_end; ++j) {
-                        const uint32_t local_id = ids[j] - window_start;
-                        candidate_bitmap[local_id >> 6] |= (1ULL << (local_id & 63));
-                    }
                 }
             }
 
             // Calculate max possible contribution from non-essential terms
             float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
 
-            // Extract candidates using bitmap - only iterate over docs that received contributions
-            size_t num_bitmap_words = (window_size + 63) / 64;
-            for (size_t word_idx = 0; word_idx < num_bitmap_words; ++word_idx) {
-                uint64_t word = candidate_bitmap[word_idx];
-                while (word != 0) {
-                    // Find lowest set bit position
-                    int bit_pos = __builtin_ctzll(word);
-                    // Clear the bit
-                    word &= word - 1;
+            // Extract candidates - use bitmap for IP (faster), linear scan for BM25
+            if (metric_type_ == SparseMetricType::METRIC_IP) {
+                // Use bitmap - only iterate over docs that received contributions
+                size_t num_bitmap_words = (window_size + 63) / 64;
+                for (size_t word_idx = 0; word_idx < num_bitmap_words; ++word_idx) {
+                    uint64_t word = candidate_bitmap[word_idx];
+                    while (word != 0) {
+                        int bit_pos = __builtin_ctzll(word);
+                        word &= word - 1;
 
-                    size_t doc_offset = (word_idx << 6) + bit_pos;
-                    if (doc_offset >= window_size)
-                        break;
+                        size_t doc_offset = (word_idx << 6) + bit_pos;
+                        if (doc_offset >= window_size)
+                            break;
 
+                        float score = scores[doc_offset];
+                        if (score + ne_upper_bound <= threshold)
+                            continue;
+
+                        table_t doc_id = window_start + static_cast<table_t>(doc_offset);
+                        if (!filter.empty() && filter.test(doc_id))
+                            continue;
+
+                        float full_score = score;
+                        for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                            if (full_score + upper_bounds[i] <= threshold)
+                                break;
+
+                            auto& pl = posting_lists[i];
+                            auto it = std::lower_bound(pl.ids.data(), pl.ids.data() + pl.ids.size(), doc_id);
+                            if (it != pl.ids.data() + pl.ids.size() && *it == doc_id) {
+                                size_t idx = it - pl.ids.data();
+                                full_score += pl.q_weight * static_cast<float>(pl.vals[idx]);
+                            }
+                        }
+
+                        if (full_score > threshold) {
+                            heap.push(doc_id, full_score);
+                            threshold = heap.full() ? heap.top().val : 0;
+                        }
+                    }
+                }
+            } else {
+                // BM25: Linear scan (bitmap overhead hurts more than it helps)
+                for (size_t doc_offset = 0; doc_offset < window_size; ++doc_offset) {
                     float score = scores[doc_offset];
-                    // Skip if can't possibly beat threshold
-                    if (score + ne_upper_bound <= threshold)
+                    if (score == 0.0f || score + ne_upper_bound <= threshold)
                         continue;
 
                     table_t doc_id = window_start + static_cast<table_t>(doc_offset);
                     if (!filter.empty() && filter.test(doc_id))
                         continue;
 
-                    // Add contributions from non-essential terms
-                    // (These are terms whose max contribution alone can't beat threshold,
-                    // but might contribute when combined with essential terms)
                     float full_score = score;
-                    float cur_vec_sum =
-                        metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+                    float cur_vec_sum = bm25_params_->row_sums_spans_[doc_id];
 
                     for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
-                        // Early termination if we can't beat threshold
                         if (full_score + upper_bounds[i] <= threshold)
                             break;
 
                         auto& pl = posting_lists[i];
-                        const table_t* ids = pl.ids.data();
-                        const QType* vals = pl.vals.data();
-                        size_t pl_size = pl.ids.size();
-
-                        // Binary search for doc_id in this posting list
-                        auto it = std::lower_bound(ids, ids + pl_size, doc_id);
-                        if (it != ids + pl_size && *it == doc_id) {
-                            size_t idx = it - ids;
-                            full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
+                        auto it = std::lower_bound(pl.ids.data(), pl.ids.data() + pl.ids.size(), doc_id);
+                        if (it != pl.ids.data() + pl.ids.size() && *it == doc_id) {
+                            size_t idx = it - pl.ids.data();
+                            full_score += pl.q_weight * computer(static_cast<float>(pl.vals[idx]), cur_vec_sum);
                         }
                     }
 
