@@ -1357,18 +1357,21 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation
+    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation and candidate bitmap
     // Process each posting list's contributions in batches rather than alternating
     // between iterators. This enables:
     // - Better memory locality (prefetcher works on sequential access)
     // - Better branch prediction (consistent pattern per posting list)
     // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
+    // - Candidate bitmap: only iterate docs that received contributions (not all 64K)
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
         // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
         constexpr size_t WINDOW_SIZE = 65536;
+        // Bitmap size: 64K docs / 64 bits per uint64_t = 1024 words
+        constexpr size_t BITMAP_WORDS = WINDOW_SIZE / 64;
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
@@ -1411,6 +1414,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         // Allocate window score buffer (aligned for SIMD)
         std::vector<float> scores(WINDOW_SIZE);
 
+        // Candidate bitmap: track which docs received contributions
+        // This avoids scanning all 64K positions - only iterate set bits
+        std::vector<uint64_t> candidate_bitmap(BITMAP_WORDS);
+
         // Track current position in each posting list (for cursor advancement across windows)
         std::vector<size_t> cursors(posting_lists.size(), 0);
 
@@ -1420,8 +1427,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 std::min(static_cast<table_t>(window_start + WINDOW_SIZE), static_cast<table_t>(n_rows_internal_));
             size_t window_size = window_end - window_start;
 
-            // Reset scores for this window
+            // Reset scores and bitmap for this window
             std::memset(scores.data(), 0, window_size * sizeof(float));
+            std::memset(candidate_bitmap.data(), 0, ((window_size + 63) / 64) * sizeof(uint64_t));
 
             // Find essential/non-essential split based on current threshold
             size_t first_ne_idx = posting_lists.size();
@@ -1468,53 +1476,70 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                                 pl.q_weight * computer(static_cast<float>(vals[j]), doc_len_ratios[doc_id]);
                         }
                     }
+
+                    // Set bits in candidate bitmap for docs in this posting list segment
+                    for (size_t j = list_start; j < list_end; ++j) {
+                        const uint32_t local_id = ids[j] - window_start;
+                        candidate_bitmap[local_id >> 6] |= (1ULL << (local_id & 63));
+                    }
                 }
             }
 
             // Calculate max possible contribution from non-essential terms
             float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
 
-            // Extract candidates from scores array
-            // A doc is a candidate if it appears in essential lists (score > 0) AND
-            // its essential score + max non-essential contribution could beat threshold
-            for (size_t doc_offset = 0; doc_offset < window_size; ++doc_offset) {
-                float score = scores[doc_offset];
-                // Skip if doc doesn't appear in any essential list, or can't possibly beat threshold
-                if (score == 0.0f || score + ne_upper_bound <= threshold)
-                    continue;
+            // Extract candidates using bitmap - only iterate over docs that received contributions
+            size_t num_bitmap_words = (window_size + 63) / 64;
+            for (size_t word_idx = 0; word_idx < num_bitmap_words; ++word_idx) {
+                uint64_t word = candidate_bitmap[word_idx];
+                while (word != 0) {
+                    // Find lowest set bit position
+                    int bit_pos = __builtin_ctzll(word);
+                    // Clear the bit
+                    word &= word - 1;
 
-                table_t doc_id = window_start + static_cast<table_t>(doc_offset);
-                if (!filter.empty() && filter.test(doc_id))
-                    continue;
-
-                // Add contributions from non-essential terms
-                // (These are terms whose max contribution alone can't beat threshold,
-                // but might contribute when combined with essential terms)
-                float full_score = score;
-                float cur_vec_sum =
-                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
-
-                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
-                    // Early termination if we can't beat threshold
-                    if (full_score + upper_bounds[i] <= threshold)
+                    size_t doc_offset = (word_idx << 6) + bit_pos;
+                    if (doc_offset >= window_size)
                         break;
 
-                    auto& pl = posting_lists[i];
-                    const table_t* ids = pl.ids.data();
-                    const QType* vals = pl.vals.data();
-                    size_t pl_size = pl.ids.size();
+                    float score = scores[doc_offset];
+                    // Skip if can't possibly beat threshold
+                    if (score + ne_upper_bound <= threshold)
+                        continue;
 
-                    // Binary search for doc_id in this posting list
-                    auto it = std::lower_bound(ids, ids + pl_size, doc_id);
-                    if (it != ids + pl_size && *it == doc_id) {
-                        size_t idx = it - ids;
-                        full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
+                    table_t doc_id = window_start + static_cast<table_t>(doc_offset);
+                    if (!filter.empty() && filter.test(doc_id))
+                        continue;
+
+                    // Add contributions from non-essential terms
+                    // (These are terms whose max contribution alone can't beat threshold,
+                    // but might contribute when combined with essential terms)
+                    float full_score = score;
+                    float cur_vec_sum =
+                        metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+
+                    for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                        // Early termination if we can't beat threshold
+                        if (full_score + upper_bounds[i] <= threshold)
+                            break;
+
+                        auto& pl = posting_lists[i];
+                        const table_t* ids = pl.ids.data();
+                        const QType* vals = pl.vals.data();
+                        size_t pl_size = pl.ids.size();
+
+                        // Binary search for doc_id in this posting list
+                        auto it = std::lower_bound(ids, ids + pl_size, doc_id);
+                        if (it != ids + pl_size && *it == doc_id) {
+                            size_t idx = it - ids;
+                            full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
+                        }
                     }
-                }
 
-                if (full_score > threshold) {
-                    heap.push(doc_id, full_score);
-                    threshold = heap.full() ? heap.top().val : 0;
+                    if (full_score > threshold) {
+                        heap.push(doc_id, full_score);
+                        threshold = heap.full() ? heap.top().val : 0;
+                    }
                 }
             }
         }
