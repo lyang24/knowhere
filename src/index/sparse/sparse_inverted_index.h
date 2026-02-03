@@ -1367,9 +1367,6 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
-        constexpr size_t WINDOW_SIZE = 65536;
-
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
@@ -1385,12 +1382,14 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         std::vector<PostingListInfo> posting_lists;
         posting_lists.reserve(q_vec.size());
 
+        size_t total_postings = 0;
         for (auto& [inner_dim, q_weight] : q_vec) {
             auto plist_ids = inverted_index_ids_spans_[inner_dim];
             auto plist_vals = inverted_index_vals_spans_[inner_dim];
             if (plist_ids.empty())
                 continue;
 
+            total_postings += plist_ids.size();
             float max_score = max_score_in_dim_spans_[inner_dim] * static_cast<float>(q_weight) * dim_max_score_ratio;
             posting_lists.push_back({static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
         }
@@ -1408,20 +1407,37 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
 
         float threshold = heap.full() ? heap.top().val : 0;
 
-        // Allocate window score buffer (aligned for SIMD)
-        std::vector<float> scores(WINDOW_SIZE);
+        // Adaptive window sizing based on posting list density
+        // Dense posting lists benefit from smaller windows (more frequent threshold updates)
+        // Sparse posting lists benefit from larger windows (amortize overhead)
+        float density = static_cast<float>(total_postings) / static_cast<float>(n_rows_internal_);
+        size_t window_size;
+        if (density > 1.0f) {
+            window_size = 4096;  // Very dense (>1 posting per doc): 4K window
+        } else if (density > 0.5f) {
+            window_size = 8192;  // Dense: 8K window
+        } else if (density > 0.2f) {
+            window_size = 16384;  // Medium-dense: 16K window
+        } else if (density > 0.1f) {
+            window_size = 32768;  // Medium: 32K window
+        } else {
+            window_size = 65536;  // Sparse: 64K window (original default)
+        }
+
+        // Allocate window score buffer
+        std::vector<float> scores(window_size);
 
         // Track current position in each posting list (for cursor advancement across windows)
         std::vector<size_t> cursors(posting_lists.size(), 0);
 
         // Process documents in windows
-        for (table_t window_start = 0; window_start < n_rows_internal_; window_start += WINDOW_SIZE) {
+        for (table_t window_start = 0; window_start < n_rows_internal_; window_start += window_size) {
             table_t window_end =
-                std::min(static_cast<table_t>(window_start + WINDOW_SIZE), static_cast<table_t>(n_rows_internal_));
-            size_t window_size = window_end - window_start;
+                std::min(static_cast<table_t>(window_start + window_size), static_cast<table_t>(n_rows_internal_));
+            size_t current_window_size = window_end - window_start;
 
             // Reset scores for this window
-            std::memset(scores.data(), 0, window_size * sizeof(float));
+            std::memset(scores.data(), 0, current_window_size * sizeof(float));
 
             // Find essential/non-essential split based on current threshold
             size_t first_ne_idx = posting_lists.size();
@@ -1477,7 +1493,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             // Extract candidates from scores array
             // A doc is a candidate if it appears in essential lists (score > 0) AND
             // its essential score + max non-essential contribution could beat threshold
-            for (size_t doc_offset = 0; doc_offset < window_size; ++doc_offset) {
+            for (size_t doc_offset = 0; doc_offset < current_window_size; ++doc_offset) {
                 float score = scores[doc_offset];
                 // Skip if doc doesn't appear in any essential list, or can't possibly beat threshold
                 if (score == 0.0f || score + ne_upper_bound <= threshold)
