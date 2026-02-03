@@ -176,6 +176,9 @@ print_usage(const char* prog) {
 
 int
 main(int argc, char** argv) {
+    // Disable stdout buffering for immediate output
+    setlinebuf(stdout);
+
     std::string data_dir;
     int64_t topk = 10;
     int64_t nq = 0;  // 0 = use all queries

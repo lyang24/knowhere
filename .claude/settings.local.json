@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(while ssh -i ~/Downloads/aws.pem ubuntu@54.153.94.133 \"pgrep -f benchmark_sparse_algo\")",
+      "Bash(do sleep 30)",
+      "Bash(done)"
+    ]
+  }
+}
