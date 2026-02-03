@@ -23,6 +23,7 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_FLOAT drop_ratio_search;
     CFG_INT refine_factor;
     CFG_FLOAT dim_max_score_ratio;
+    CFG_INT sketch_terms;  // Two-phase: batch process only top sketch_terms (0 = disabled)
     CFG_STRING inverted_index_algo;
     KNOHWERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
@@ -80,6 +81,18 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_range(0.5, 1.3)
             .set_default(1.05)
             .description("ratio to upscale/downscale the max score of each dimension")
+            .for_search();
+        /**
+         * Two-phase search optimization (sketch_terms):
+         * - Phase 1 (Sketch): Batch process only top sketch_terms posting lists
+         * - Phase 2 (Refine): Evaluate remaining terms for promising candidates
+         * Based on Seismic paper: top terms capture most query importance.
+         * Set to 0 to disable two-phase (use standard MaxScore).
+         */
+        KNOWHERE_CONFIG_DECLARE_FIELD(sketch_terms)
+            .description("number of terms for sketch phase (0 = disabled)")
+            .set_default(0)
+            .set_range(0, 1000)
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(inverted_index_algo)
             .description("inverted index algorithm")

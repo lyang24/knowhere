@@ -311,81 +311,82 @@ main(int argc, char** argv) {
             auto query_ds = knowhere::GenDataSet(1, queries.n_cols, nullptr);
             query_ds->SetIsSparse(true);
 
-            // Run benchmark
-            printf("\n[Running Search Benchmark]\n");
-            std::vector<double> run_times;
-            std::vector<int64_t> all_results(nq * topk, -1);  // Initialize to -1 for invalid detection
-            std::vector<bool> query_success(nq, false);
-            int64_t failed_queries = 0;
+            // sketch_terms values to test (0 = disabled, then various sizes)
+            // Based on Seismic paper: top terms in sketch phase capture most query importance
+            std::vector<int> sketch_values = {0};  // Baseline: no two-phase
+            if (algo == "DAAT_MAXSCORE_V2") {
+                sketch_values = {0, 5, 10, 15, 20};  // Test various sketch sizes
+            }
 
-            for (int run = 0; run < total_runs; ++run) {
-                Timer search_timer;
-                failed_queries = 0;
+            for (int sketch_terms : sketch_values) {
+                search_conf["sketch_terms"] = sketch_terms;
 
-                for (int64_t q = 0; q < nq; ++q) {
-                    query_ds->SetTensor(&query_rows[q]);
+                // Run benchmark
+                printf("\n[Running Search Benchmark] sketch_terms=%d\n", sketch_terms);
+                std::vector<double> run_times;
+                std::vector<int64_t> all_results(nq * topk, -1);  // Initialize to -1 for invalid detection
+                std::vector<bool> query_success(nq, false);
+                int64_t failed_queries = 0;
 
-                    auto result = index.Search(query_ds, search_conf, knowhere::BitsetView());
-                    if (!result.has_value()) {
-                        failed_queries++;
-                        query_success[q] = false;
-                        // Clear stale results from previous runs
-                        std::fill(&all_results[q * topk], &all_results[(q + 1) * topk], -1);
-                        continue;
+                for (int run = 0; run < total_runs; ++run) {
+                    Timer search_timer;
+                    failed_queries = 0;
+
+                    for (int64_t q = 0; q < nq; ++q) {
+                        query_ds->SetTensor(&query_rows[q]);
+
+                        auto result = index.Search(query_ds, search_conf, knowhere::BitsetView());
+                        if (!result.has_value()) {
+                            failed_queries++;
+                            query_success[q] = false;
+                            // Clear stale results from previous runs
+                            std::fill(&all_results[q * topk], &all_results[(q + 1) * topk], -1);
+                            continue;
+                        }
+
+                        query_success[q] = true;
+                        auto ids = result.value()->GetIds();
+                        memcpy(&all_results[q * topk], ids, topk * sizeof(int64_t));
                     }
 
-                    query_success[q] = true;
-                    auto ids = result.value()->GetIds();
-                    memcpy(&all_results[q * topk], ids, topk * sizeof(int64_t));
+                    double elapsed = search_timer.elapsed_ms();
+                    run_times.push_back(elapsed);
+                    printf("  Run %d: %.2f ms (%.1f batch QPS)\n", run + 1, elapsed, nq * 1000.0 / elapsed);
                 }
 
-                double elapsed = search_timer.elapsed_ms();
-                run_times.push_back(elapsed);
-                printf("  Run %d: %.2f ms (%.1f batch QPS)\n", run + 1, elapsed, nq * 1000.0 / elapsed);
-            }
+                if (failed_queries > 0) {
+                    printf("  Warning: %ld queries failed in last run\n", failed_queries);
+                }
 
-            if (failed_queries > 0) {
-                printf("  Warning: %ld queries failed in last run\n", failed_queries);
-            }
+                // Calculate average of last (total_runs - warmup_runs) runs
+                double avg_time = 0;
+                for (int i = warmup_runs; i < total_runs; ++i) {
+                    avg_time += run_times[i];
+                }
+                avg_time /= (total_runs - warmup_runs);
 
-            // Calculate average of last (total_runs - warmup_runs) runs
-            double avg_time = 0;
-            for (int i = warmup_runs; i < total_runs; ++i) {
-                avg_time += run_times[i];
-            }
-            avg_time /= (total_runs - warmup_runs);
-
-            // Compute recall on last run's results (only for successful queries)
-            float avg_recall = 0;
-            int64_t valid_queries = 0;
-            if (gt.nq > 0) {
-                for (int64_t q = 0; q < nq; ++q) {
-                    if (query_success[q]) {
-                        avg_recall += gt.compute_recall(&all_results[q * topk], q, topk);
-                        valid_queries++;
+                // Compute recall on last run's results (only for successful queries)
+                float avg_recall = 0;
+                int64_t valid_queries = 0;
+                if (gt.nq > 0) {
+                    for (int64_t q = 0; q < nq; ++q) {
+                        if (query_success[q]) {
+                            avg_recall += gt.compute_recall(&all_results[q * topk], q, topk);
+                            valid_queries++;
+                        }
+                    }
+                    if (valid_queries > 0) {
+                        avg_recall /= valid_queries;
                     }
                 }
-                if (valid_queries > 0) {
-                    avg_recall /= valid_queries;
-                }
-            }
 
-            printf("\n[Results for %s (%s)]\n", algo.c_str(), metric.c_str());
-            printf("  Avg search time: %.2f ms (over %d timed runs)\n", avg_time, total_runs - warmup_runs);
-            printf("  Batch QPS: %.1f (nq=%ld)\n", nq * 1000.0 / avg_time, nq);
-            printf("  Recall@%ld: %.4f (%.2f%%) [from last run, %ld/%ld queries]\n", topk, avg_recall, avg_recall * 100,
-                   valid_queries, nq);
-            // Debug: print first 3 successful queries' top-3 results to verify correctness
-            printf("  Debug - First 3 successful queries top-3 IDs: ");
-            int printed = 0;
-            for (int64_t q = 0; q < nq && printed < 3; ++q) {
-                if (query_success[q]) {
-                    printf("[q%ld: %ld,%ld,%ld] ", q, all_results[q * topk], all_results[q * topk + 1],
-                           all_results[q * topk + 2]);
-                    printed++;
-                }
-            }
-            printf("\n");
+                printf("\n[Results for %s (%s) sketch_terms=%d]\n", algo.c_str(), metric.c_str(), sketch_terms);
+                printf("  Avg search time: %.2f ms (over %d timed runs)\n", avg_time, total_runs - warmup_runs);
+                printf("  Batch QPS: %.1f (nq=%ld)\n", nq * 1000.0 / avg_time, nq);
+                printf("  Recall@%ld: %.4f (%.2f%%) [from last run, %ld/%ld queries]\n", topk, avg_recall,
+                       avg_recall * 100, valid_queries, nq);
+
+            }  // end sketch_terms loop
         }
     }
 

@@ -70,6 +70,7 @@ struct InvertedIndexApproxSearchParams {
     int refine_factor;
     float drop_ratio_search;
     float dim_max_score_ratio;
+    int sketch_terms;  // Two-phase: batch process only top sketch_terms (0 = disabled)
 };
 
 template <typename T>
@@ -850,7 +851,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio,
+                                    approx_params.sketch_terms);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1363,10 +1365,16 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     // - Better memory locality (prefetcher works on sequential access)
     // - Better branch prediction (consistent pattern per posting list)
     // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
+    //
+    // Two-phase optimization (sketch_terms > 0):
+    // - Phase 1 (Sketch): Process only top sketch_terms posting lists in batch
+    // - Phase 2 (Refine): For promising candidates, evaluate remaining terms
+    // Based on Seismic paper: top terms capture most of query's discriminative power
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
-                            const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
+                            const DocValueComputer<float>& computer, float dim_max_score_ratio,
+                            int sketch_terms = 0) const {
         // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
         constexpr size_t WINDOW_SIZE = 65536;
 
@@ -1414,6 +1422,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         // Track current position in each posting list (for cursor advancement across windows)
         std::vector<size_t> cursors(posting_lists.size(), 0);
 
+        // Two-phase: determine sketch boundary
+        // sketch_terms <= 0 means no two-phase (use standard essential/non-essential split)
+        const bool use_two_phase = sketch_terms > 0 && static_cast<size_t>(sketch_terms) < posting_lists.size();
+        const size_t sketch_boundary = use_two_phase ? static_cast<size_t>(sketch_terms) : posting_lists.size();
+
         // Process documents in windows
         for (table_t window_start = 0; window_start < n_rows_internal_; window_start += WINDOW_SIZE) {
             table_t window_end =
@@ -1431,10 +1444,14 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             if (first_ne_idx == 0)
                 break;  // No more candidates possible
 
-            // BATCH PROCESS each essential posting list
+            // Two-phase: limit batch processing to sketch terms only
+            // The sketch phase processes fewer terms, allowing more candidates to be filtered early
+            size_t batch_limit = use_two_phase ? std::min(sketch_boundary, first_ne_idx) : first_ne_idx;
+
+            // BATCH PROCESS posting lists up to batch_limit
             // Process all contributions from one posting list before moving to the next,
             // enabling CPU prefetcher and SIMD
-            for (size_t i = 0; i < first_ne_idx; ++i) {
+            for (size_t i = 0; i < batch_limit; ++i) {
                 auto& pl = posting_lists[i];
                 const table_t* ids = pl.ids.data();
                 const QType* vals = pl.vals.data();
@@ -1471,30 +1488,33 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 }
             }
 
-            // Calculate max possible contribution from non-essential terms
-            float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
+            // Calculate max possible contribution from terms not yet processed in batch
+            // In two-phase mode: batch_limit..first_ne_idx are essential but not batched, plus non-essential
+            // In standard mode: batch_limit == first_ne_idx, so only non-essential terms
+            float remaining_upper_bound = (batch_limit < posting_lists.size()) ? upper_bounds[batch_limit] : 0.0f;
 
             // Extract candidates from scores array
-            // A doc is a candidate if it appears in essential lists (score > 0) AND
-            // its essential score + max non-essential contribution could beat threshold
+            // A doc is a candidate if it appears in batch-processed lists (score > 0) AND
+            // its batch score + max remaining contribution could beat threshold
             for (size_t doc_offset = 0; doc_offset < window_size; ++doc_offset) {
                 float score = scores[doc_offset];
-                // Skip if doc doesn't appear in any essential list, or can't possibly beat threshold
-                if (score == 0.0f || score + ne_upper_bound <= threshold)
+                // Skip if doc doesn't appear in any batch-processed list, or can't possibly beat threshold
+                if (score == 0.0f || score + remaining_upper_bound <= threshold)
                     continue;
 
                 table_t doc_id = window_start + static_cast<table_t>(doc_offset);
                 if (!filter.empty() && filter.test(doc_id))
                     continue;
 
-                // Add contributions from non-essential terms
-                // (These are terms whose max contribution alone can't beat threshold,
-                // but might contribute when combined with essential terms)
+                // Add contributions from remaining terms (both unbatched essential and non-essential)
                 float full_score = score;
                 float cur_vec_sum =
                     metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
 
-                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                // In two-phase mode: evaluate remaining essential terms (batch_limit to first_ne_idx)
+                // then non-essential terms (first_ne_idx to end)
+                // In standard mode: batch_limit == first_ne_idx, so this starts at non-essential
+                for (size_t i = batch_limit; i < posting_lists.size(); ++i) {
                     // Early termination if we can't beat threshold
                     if (full_score + upper_bounds[i] <= threshold)
                         break;
