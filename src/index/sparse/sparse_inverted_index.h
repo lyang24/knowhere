@@ -70,6 +70,7 @@ struct InvertedIndexApproxSearchParams {
     int refine_factor;
     float drop_ratio_search;
     float dim_max_score_ratio;
+    float query_prune_alpha;
 };
 
 template <typename T>
@@ -850,7 +851,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio,
+                                    approx_params.query_prune_alpha);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1366,7 +1368,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
-                            const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
+                            const DocValueComputer<float>& computer, float dim_max_score_ratio,
+                            float query_prune_alpha = 1.0f) const {
         // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
         constexpr size_t WINDOW_SIZE = 65536;
 
@@ -1374,6 +1377,25 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
         });
+
+        // Query pruning (alpha-MSS style): keep only terms capturing alpha fraction of total weight
+        if (query_prune_alpha < 1.0f && !q_vec.empty()) {
+            float total_weight = 0.0f;
+            for (const auto& [dim, weight] : q_vec) {
+                total_weight += static_cast<float>(weight);
+            }
+            float target_weight = total_weight * query_prune_alpha;
+            float cumulative_weight = 0.0f;
+            size_t keep_count = 0;
+            for (size_t i = 0; i < q_vec.size(); ++i) {
+                cumulative_weight += static_cast<float>(q_vec[i].second);
+                keep_count = i + 1;
+                if (cumulative_weight >= target_weight) {
+                    break;
+                }
+            }
+            q_vec.resize(keep_count);
+        }
 
         // Build posting list info for each query term
         struct PostingListInfo {

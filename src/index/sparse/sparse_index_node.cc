@@ -119,10 +119,12 @@ class SparseInvertedIndexNode : public IndexNode {
             refine_factor = 1;
         }
 
+        auto query_prune_alpha = cfg.query_prune_alpha.value_or(1.0f);
         sparse::InvertedIndexApproxSearchParams approx_params = {
             .refine_factor = refine_factor,
             .drop_ratio_search = drop_ratio_search,
             .dim_max_score_ratio = dim_max_score_ratio,
+            .query_prune_alpha = query_prune_alpha,
         };
 
         auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());

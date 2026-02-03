@@ -23,6 +23,7 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_FLOAT drop_ratio_search;
     CFG_INT refine_factor;
     CFG_FLOAT dim_max_score_ratio;
+    CFG_FLOAT query_prune_alpha;
     CFG_STRING inverted_index_algo;
     KNOHWERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
@@ -80,6 +81,11 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_range(0.5, 1.3)
             .set_default(1.05)
             .description("ratio to upscale/downscale the max score of each dimension")
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(query_prune_alpha)
+            .set_range(0.0, 1.0)
+            .set_default(1.0)
+            .description("query pruning alpha: keep terms capturing this fraction of query weight (1.0=no pruning)")
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(inverted_index_algo)
             .description("inverted index algorithm")
