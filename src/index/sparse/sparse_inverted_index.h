@@ -70,6 +70,7 @@ struct InvertedIndexApproxSearchParams {
     int refine_factor;
     float drop_ratio_search;
     float dim_max_score_ratio;
+    int q_cut;  // Query pruning: use only top q_cut query terms (0 = no pruning)
 };
 
 template <typename T>
@@ -850,7 +851,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio,
+                                    approx_params.q_cut);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1363,10 +1365,14 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     // - Better memory locality (prefetcher works on sequential access)
     // - Better branch prediction (consistent pattern per posting list)
     // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
+    //
+    // q_cut: Query pruning - use only top q_cut query terms (0 = no pruning)
+    // Based on concentration of importance principle from Seismic paper:
+    // top 10-15 query terms capture 75%+ of query mass.
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
-                            const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
+                            const DocValueComputer<float>& computer, float dim_max_score_ratio, int q_cut = 0) const {
         // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
         constexpr size_t WINDOW_SIZE = 65536;
 
@@ -1374,6 +1380,13 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
         });
+
+        // Query pruning (q_cut): Keep only top q_cut query terms
+        // This trades recall for speed based on the observation that top query terms
+        // capture most of the query's discriminative power
+        if (q_cut > 0 && q_vec.size() > static_cast<size_t>(q_cut)) {
+            q_vec.resize(q_cut);
+        }
 
         // Build posting list info for each query term
         struct PostingListInfo {

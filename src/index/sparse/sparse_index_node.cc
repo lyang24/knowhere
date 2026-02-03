@@ -114,6 +114,7 @@ class SparseInvertedIndexNode : public IndexNode {
         auto dim_max_score_ratio = cfg.dim_max_score_ratio.value();
         auto drop_ratio_search = cfg.drop_ratio_search.value_or(0.0f);
         auto refine_factor = cfg.refine_factor.value_or(1);
+        auto q_cut = cfg.q_cut.value_or(0);
         // if no data was dropped during search, no refinement is needed.
         if (drop_ratio_search == 0) {
             refine_factor = 1;
@@ -123,6 +124,7 @@ class SparseInvertedIndexNode : public IndexNode {
             .refine_factor = refine_factor,
             .drop_ratio_search = drop_ratio_search,
             .dim_max_score_ratio = dim_max_score_ratio,
+            .q_cut = q_cut,
         };
 
         auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());

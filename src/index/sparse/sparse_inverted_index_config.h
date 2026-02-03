@@ -23,6 +23,7 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_FLOAT drop_ratio_search;
     CFG_INT refine_factor;
     CFG_FLOAT dim_max_score_ratio;
+    CFG_INT q_cut;  // Query pruning: use only top q_cut query terms (0 = no pruning)
     CFG_STRING inverted_index_algo;
     KNOHWERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
@@ -80,6 +81,17 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_range(0.5, 1.3)
             .set_default(1.05)
             .description("ratio to upscale/downscale the max score of each dimension")
+            .for_search();
+        /**
+         * Query pruning (q_cut): Use only the top q_cut query terms with
+         * the largest values. Based on concentration of importance principle:
+         * top 10-15 query terms typically capture 75%+ of query mass.
+         * Set to 0 to disable query pruning.
+         */
+        KNOWHERE_CONFIG_DECLARE_FIELD(q_cut)
+            .description("max number of query terms to use (0 = no pruning)")
+            .set_default(0)
+            .set_range(0, 1000)
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(inverted_index_algo)
             .description("inverted index algorithm")
