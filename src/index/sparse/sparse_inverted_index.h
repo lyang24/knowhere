@@ -16,12 +16,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <boost/core/span.hpp>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <unordered_map>
 #include <vector>
 
@@ -1358,17 +1360,21 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     }
 
     // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation
+    // + Score-ordered shortlist: check top-scoring docs per dimension first
     // Process each posting list's contributions in batches rather than alternating
     // between iterators. This enables:
     // - Better memory locality (prefetcher works on sequential access)
     // - Better branch prediction (consistent pattern per posting list)
     // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
+    // - Early threshold building from high-score shortlisted docs
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
         // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
         constexpr size_t WINDOW_SIZE = 65536;
+        // Number of top docs to check per query term for early threshold building
+        constexpr size_t SHORTLIST_SIZE = 32;
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
@@ -1408,6 +1414,71 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
 
         float threshold = heap.full() ? heap.top().val : 0;
 
+        // === PHASE 1: Score-ordered shortlist - check top docs per term first ===
+        // For each query term, find the top-scoring docs and evaluate them immediately
+        // This builds threshold quickly before window processing
+        {
+            // Collect (score, doc_id, val_idx_per_term) for top docs across all terms
+            std::vector<std::pair<float, table_t>> shortlist_candidates;
+            shortlist_candidates.reserve(SHORTLIST_SIZE * posting_lists.size());
+
+            for (size_t term_idx = 0; term_idx < posting_lists.size(); ++term_idx) {
+                auto& pl = posting_lists[term_idx];
+                const table_t* ids = pl.ids.data();
+                const QType* vals = pl.vals.data();
+                size_t pl_size = pl.ids.size();
+
+                // Find top SHORTLIST_SIZE entries by value in this posting list
+                // Use partial_sort for efficiency
+                std::vector<size_t> indices(std::min(pl_size, SHORTLIST_SIZE * 4));
+                std::iota(indices.begin(), indices.end(), 0);
+
+                size_t num_to_check = std::min(indices.size(), SHORTLIST_SIZE);
+                std::partial_sort(indices.begin(), indices.begin() + num_to_check, indices.end(),
+                                  [vals](size_t a, size_t b) { return vals[a] > vals[b]; });
+
+                for (size_t i = 0; i < num_to_check; ++i) {
+                    size_t idx = indices[i];
+                    float contrib = pl.q_weight * static_cast<float>(vals[idx]);
+                    shortlist_candidates.emplace_back(contrib, ids[idx]);
+                }
+            }
+
+            // Sort shortlist by contribution descending
+            std::sort(shortlist_candidates.begin(), shortlist_candidates.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+
+            // Evaluate unique docs from shortlist
+            table_t last_doc = std::numeric_limits<table_t>::max();
+            for (const auto& [contrib, doc_id] : shortlist_candidates) {
+                if (doc_id == last_doc)
+                    continue;  // Skip duplicates
+                last_doc = doc_id;
+
+                if (!filter.empty() && filter.test(doc_id))
+                    continue;
+
+                // Compute full score for this doc
+                float full_score = 0.0f;
+                float cur_vec_sum =
+                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+
+                for (auto& pl : posting_lists) {
+                    auto it = std::lower_bound(pl.ids.data(), pl.ids.data() + pl.ids.size(), doc_id);
+                    if (it != pl.ids.data() + pl.ids.size() && *it == doc_id) {
+                        size_t idx = it - pl.ids.data();
+                        full_score += pl.q_weight * computer(static_cast<float>(pl.vals[idx]), cur_vec_sum);
+                    }
+                }
+
+                if (full_score > threshold) {
+                    heap.push(doc_id, full_score);
+                    threshold = heap.full() ? heap.top().val : 0;
+                }
+            }
+        }
+
+        // === PHASE 2: Window-based processing with raised threshold ===
         // Allocate window score buffer (aligned for SIMD)
         std::vector<float> scores(WINDOW_SIZE);
 
