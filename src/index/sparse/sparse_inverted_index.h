@@ -1357,13 +1357,15 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation and candidate bitmap
+    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation,
+    // candidate bitmap, and progressive threshold estimation
     // Process each posting list's contributions in batches rather than alternating
     // between iterators. This enables:
     // - Better memory locality (prefetcher works on sequential access)
     // - Better branch prediction (consistent pattern per posting list)
     // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
     // - Candidate bitmap: only iterate docs that received contributions (not all 64K)
+    // - Progressive threshold: process high-score candidates first to build threshold faster
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
@@ -1417,6 +1419,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         // Candidate bitmap: track which docs received contributions
         // This avoids scanning all 64K positions - only iterate set bits
         std::vector<uint64_t> candidate_bitmap(BITMAP_WORDS);
+
+        // Candidate list for sorted processing (enables progressive threshold building)
+        // Process high-score candidates first to raise threshold faster
+        std::vector<std::pair<float, table_t>> candidates;
+        candidates.reserve(4096);  // Pre-allocate for typical candidate count
 
         // Track current position in each posting list (for cursor advancement across windows)
         std::vector<size_t> cursors(posting_lists.size(), 0);
@@ -1488,14 +1495,13 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             // Calculate max possible contribution from non-essential terms
             float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
 
-            // Extract candidates using bitmap - only iterate over docs that received contributions
+            // Collect candidates from bitmap into sorted list
+            candidates.clear();
             size_t num_bitmap_words = (window_size + 63) / 64;
             for (size_t word_idx = 0; word_idx < num_bitmap_words; ++word_idx) {
                 uint64_t word = candidate_bitmap[word_idx];
                 while (word != 0) {
-                    // Find lowest set bit position
                     int bit_pos = __builtin_ctzll(word);
-                    // Clear the bit
                     word &= word - 1;
 
                     size_t doc_offset = (word_idx << 6) + bit_pos;
@@ -1503,7 +1509,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                         break;
 
                     float score = scores[doc_offset];
-                    // Skip if can't possibly beat threshold
+                    // Skip if can't possibly beat threshold (use essential score only for filtering)
                     if (score + ne_upper_bound <= threshold)
                         continue;
 
@@ -1511,35 +1517,46 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                     if (!filter.empty() && filter.test(doc_id))
                         continue;
 
-                    // Add contributions from non-essential terms
-                    // (These are terms whose max contribution alone can't beat threshold,
-                    // but might contribute when combined with essential terms)
-                    float full_score = score;
-                    float cur_vec_sum =
-                        metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+                    candidates.emplace_back(score, doc_id);
+                }
+            }
 
-                    for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
-                        // Early termination if we can't beat threshold
-                        if (full_score + upper_bounds[i] <= threshold)
-                            break;
+            // Sort candidates by essential score descending - process best first to build threshold faster
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
 
-                        auto& pl = posting_lists[i];
-                        const table_t* ids = pl.ids.data();
-                        const QType* vals = pl.vals.data();
-                        size_t pl_size = pl.ids.size();
+            // Process sorted candidates
+            for (const auto& [essential_score, doc_id] : candidates) {
+                // Re-check threshold (may have increased from earlier candidates)
+                if (essential_score + ne_upper_bound <= threshold)
+                    continue;
 
-                        // Binary search for doc_id in this posting list
-                        auto it = std::lower_bound(ids, ids + pl_size, doc_id);
-                        if (it != ids + pl_size && *it == doc_id) {
-                            size_t idx = it - ids;
-                            full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
-                        }
+                // Add contributions from non-essential terms
+                float full_score = essential_score;
+                float cur_vec_sum =
+                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+
+                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                    // Early termination if we can't beat threshold
+                    if (full_score + upper_bounds[i] <= threshold)
+                        break;
+
+                    auto& pl = posting_lists[i];
+                    const table_t* ids = pl.ids.data();
+                    const QType* vals = pl.vals.data();
+                    size_t pl_size = pl.ids.size();
+
+                    // Binary search for doc_id in this posting list
+                    auto it = std::lower_bound(ids, ids + pl_size, doc_id);
+                    if (it != ids + pl_size && *it == doc_id) {
+                        size_t idx = it - ids;
+                        full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
                     }
+                }
 
-                    if (full_score > threshold) {
-                        heap.push(doc_id, full_score);
-                        threshold = heap.full() ? heap.top().val : 0;
-                    }
+                if (full_score > threshold) {
+                    heap.push(doc_id, full_score);
+                    threshold = heap.full() ? heap.top().val : 0;
                 }
             }
         }
