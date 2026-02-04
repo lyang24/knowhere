@@ -24,6 +24,7 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_INT refine_factor;
     CFG_FLOAT dim_max_score_ratio;
     CFG_STRING inverted_index_algo;
+    CFG_BOOL use_block_max;
     KNOHWERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
         KNOWHERE_CONFIG_DECLARE_FIELD(drop_ratio_build)
@@ -84,6 +85,12 @@ class SparseInvertedIndexConfig : public BaseConfig {
         KNOWHERE_CONFIG_DECLARE_FIELD(inverted_index_algo)
             .description("inverted index algorithm")
             .set_default("DAAT_MAXSCORE")
+            .for_train()
+            .for_deserialize()
+            .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(use_block_max)
+            .description("enable block-max scores for window-level pruning in DAAT_MAXSCORE_V2")
+            .set_default(false)
             .for_train()
             .for_deserialize()
             .for_deserialize_from_file();

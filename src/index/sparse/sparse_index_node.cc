@@ -413,6 +413,7 @@ class SparseInvertedIndexNode : public IndexNode {
                     new sparse::InvertedIndex<value_type, uint16_t, sparse::InvertedIndexAlgo::DAAT_MAXSCORE_V2,
                                               mmapped>(sparse::SparseMetricType::METRIC_BM25);
                 index->SetBM25Params(k1, b, avgdl);
+                index->SetUseBlockMax(cfg.use_block_max.value_or(false));
                 return index;
             } else if (cfg.inverted_index_algo.value() == "TAAT_NAIVE") {
                 auto index =
@@ -439,6 +440,7 @@ class SparseInvertedIndexNode : public IndexNode {
                 auto index =
                     new sparse::InvertedIndex<value_type, float, sparse::InvertedIndexAlgo::DAAT_MAXSCORE_V2, mmapped>(
                         sparse::SparseMetricType::METRIC_IP);
+                index->SetUseBlockMax(cfg.use_block_max.value_or(false));
                 return index;
             } else if (cfg.inverted_index_algo.value() == "TAAT_NAIVE") {
                 auto index =

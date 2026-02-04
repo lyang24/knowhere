@@ -111,6 +111,9 @@ class BaseInvertedIndex {
     virtual expected<DocValueComputer<T>>
     GetDocValueComputer(const SparseInvertedIndexConfig& cfg) const = 0;
 
+    virtual void
+    SetUseBlockMax(bool use_block_max) = 0;
+
     [[nodiscard]] virtual size_t
     size() const = 0;
 
@@ -174,6 +177,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     SetBM25Params(float k1, float b, float avgdl) {
         bm25_params_ = std::make_unique<BM25Params>(k1, b, avgdl);
+    }
+
+    void
+    SetUseBlockMax(bool use_block_max) override {
+        use_block_max_ = use_block_max;
     }
 
     expected<DocValueComputer<float>>
@@ -361,6 +369,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             bm25_params_->row_sums_spans_ =
                 boost::span<const float>(bm25_params_->row_sums.data(), bm25_params_->row_sums.size());
         }
+
+        // Compute block-max scores for window-level pruning
+        compute_block_max_scores();
 
         return Status::success;
     }
@@ -823,6 +834,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 bm25_params_->row_sums_spans_ =
                     boost::span<const float>(bm25_params_->row_sums.data(), bm25_params_->row_sums.size());
             }
+
+            // Compute block-max scores for window-level pruning
+            compute_block_max_scores();
 
             return Status::success;
         }
@@ -1377,6 +1391,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
 
         // Build posting list info for each query term
         struct PostingListInfo {
+            size_t inner_dim;  // For block-max lookup
             float q_weight;
             float max_score;
             boost::span<const table_t> ids;
@@ -1392,7 +1407,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 continue;
 
             float max_score = max_score_in_dim_spans_[inner_dim] * static_cast<float>(q_weight) * dim_max_score_ratio;
-            posting_lists.push_back({static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
+            posting_lists.push_back({inner_dim, static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
         }
 
         if (posting_lists.empty())
@@ -1420,9 +1435,6 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 std::min(static_cast<table_t>(window_start + WINDOW_SIZE), static_cast<table_t>(n_rows_internal_));
             size_t window_size = window_end - window_start;
 
-            // Reset scores for this window
-            std::memset(scores.data(), 0, window_size * sizeof(float));
-
             // Find essential/non-essential split based on current threshold
             size_t first_ne_idx = posting_lists.size();
             while (first_ne_idx > 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
@@ -1430,6 +1442,33 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             }
             if (first_ne_idx == 0)
                 break;  // No more candidates possible
+
+            // Block-max window pruning: compute max possible score for this window
+            // If the max possible score can't beat threshold, skip the entire window
+            if (use_block_max_ && !block_max_scores_.empty()) {
+                float window_max_score = 0.0f;
+                for (size_t i = 0; i < posting_lists.size(); ++i) {
+                    auto& pl = posting_lists[i];
+                    float block_max = compute_window_upper_bound(pl.inner_dim, window_start, window_end);
+                    window_max_score += pl.q_weight * block_max * dim_max_score_ratio;
+                }
+                if (window_max_score <= threshold) {
+                    // Skip this window - no document can beat threshold
+                    // Still need to advance cursors past this window
+                    for (size_t i = 0; i < posting_lists.size(); ++i) {
+                        auto& pl = posting_lists[i];
+                        const table_t* ids = pl.ids.data();
+                        size_t pl_size = pl.ids.size();
+                        while (cursors[i] < pl_size && ids[cursors[i]] < window_end) {
+                            cursors[i]++;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Reset scores for this window
+            std::memset(scores.data(), 0, window_size * sizeof(float));
 
             // BATCH PROCESS each essential posting list
             // Process all contributions from one posting list before moving to the next,
@@ -1565,6 +1604,106 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
+    // Compute block-max scores for window-level pruning (BMW-style optimization)
+    // Must be called after posting lists and spans are fully built
+    void
+    compute_block_max_scores() {
+        if constexpr (algo != InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
+            return;  // Only needed for DAAT_MAXSCORE_V2
+        }
+        if (!use_block_max_) {
+            return;
+        }
+
+        block_max_scores_.resize(nr_inner_dims_);
+        block_first_doc_ids_.resize(nr_inner_dims_);
+
+        for (size_t dim = 0; dim < nr_inner_dims_; ++dim) {
+            const auto& ids = inverted_index_ids_spans_[dim];
+            const auto& vals = inverted_index_vals_spans_[dim];
+            size_t pl_size = ids.size();
+
+            if (pl_size == 0) {
+                continue;
+            }
+
+            size_t num_blocks = (pl_size + BLOCK_MAX_SIZE - 1) / BLOCK_MAX_SIZE;
+            block_max_scores_[dim].resize(num_blocks);
+            block_first_doc_ids_[dim].resize(num_blocks);
+
+            for (size_t b = 0; b < num_blocks; ++b) {
+                size_t block_start = b * BLOCK_MAX_SIZE;
+                size_t block_end = std::min(block_start + BLOCK_MAX_SIZE, pl_size);
+
+                // Store first doc_id in block for fast window lookup
+                block_first_doc_ids_[dim][b] = ids[block_start];
+
+                // Compute max value in block
+                float max_val = 0.0f;
+                for (size_t i = block_start; i < block_end; ++i) {
+                    max_val = std::max(max_val, static_cast<float>(vals[i]));
+                }
+                block_max_scores_[dim][b] = max_val;
+            }
+        }
+    }
+
+    // Compute window upper bound for a posting list using block-max scores
+    // Returns the maximum possible contribution from this posting list within [window_start, window_end)
+    inline float
+    compute_window_upper_bound(size_t dim, table_t window_start, table_t window_end) const {
+        if (!use_block_max_ || block_max_scores_[dim].empty()) {
+            // Fall back to global max
+            return max_score_in_dim_spans_[dim];
+        }
+
+        const auto& first_doc_ids = block_first_doc_ids_[dim];
+        const auto& block_maxs = block_max_scores_[dim];
+        const auto& ids = inverted_index_ids_spans_[dim];
+        size_t pl_size = ids.size();
+        size_t num_blocks = block_maxs.size();
+
+        // Binary search to find first block that might overlap with window
+        // A block [b_start, b_end) overlaps with [window_start, window_end) if:
+        //   b_start < window_end AND b_end > window_start
+        // We find the first block whose last doc_id >= window_start
+
+        // Find first block where first_doc_id of NEXT block > window_start (or last block)
+        size_t first_block = 0;
+        if (first_doc_ids[0] >= window_end) {
+            return 0.0f;  // All blocks are after window
+        }
+
+        // Binary search for first relevant block
+        size_t lo = 0, hi = num_blocks;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            // Check if this block's last doc could be >= window_start
+            size_t block_end_pos = std::min((mid + 1) * BLOCK_MAX_SIZE, pl_size) - 1;
+            if (ids[block_end_pos] < window_start) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        first_block = lo;
+
+        if (first_block >= num_blocks) {
+            return 0.0f;
+        }
+
+        // Find max block score within window range
+        float max_score = 0.0f;
+        for (size_t b = first_block; b < num_blocks; ++b) {
+            if (first_doc_ids[b] >= window_end) {
+                break;  // All remaining blocks are after window
+            }
+            max_score = std::max(max_score, block_maxs[b]);
+        }
+
+        return max_score;
+    }
+
     inline void
     add_row_to_index(const SparseRow<DType>& row, table_t vec_id) {
         [[maybe_unused]] float row_sum = 0;
@@ -1648,6 +1787,15 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     std::vector<boost::span<const QType>> inverted_index_vals_spans_;
     Vector<float> max_score_in_dim_;
     boost::span<const float> max_score_in_dim_spans_;
+
+    // Block-max scores for window-level pruning (BMW-style optimization)
+    // Each posting list is divided into blocks of BLOCK_MAX_SIZE postings.
+    // block_max_scores_[dim][block_idx] = max value in that block
+    // block_doc_ids_[dim][block_idx] = first doc_id in that block (for fast window lookup)
+    static constexpr size_t BLOCK_MAX_SIZE = 128;
+    bool use_block_max_ = false;
+    std::vector<std::vector<float>> block_max_scores_;
+    std::vector<std::vector<table_t>> block_first_doc_ids_;
 
     SparseMetricType metric_type_;
 

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/lanqing/repos/knowhere branch:*)",
+      "Bash(git -C /Users/lanqing/repos/knowhere status)"
+    ]
+  }
+}
