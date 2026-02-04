@@ -87,8 +87,14 @@ accumulate_posting_list_ip_avx512(const uint32_t* doc_ids, const float* doc_vals
 // scores[doc_ids[i] - window_start] += q_weight * doc_vals[i]
 // Only processes elements where doc_ids[i] is in [window_start, window_end)
 //
+// IMPORTANT: This function uses AVX512 scatter instructions which have undefined
+// behavior if multiple lanes write to the same index. This is safe because:
+// - Posting lists contain unique doc_ids (each document appears at most once per term)
+// - Therefore, within any SIMD batch of 16 consecutive elements, all local_ids are distinct
+// The inverted index structure guarantees this invariant during construction.
+//
 // Parameters:
-//   doc_ids: posting list doc IDs (must be sorted)
+//   doc_ids: posting list doc IDs (must be sorted and unique within the list)
 //   doc_vals: posting list values
 //   list_start: start index in posting list (elements before this are < window_start)
 //   list_end: end index in posting list (elements from this point are >= window_end)

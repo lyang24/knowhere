@@ -319,3 +319,110 @@ TEST_CASE("Test Sparse SIMD AVX512 - Multiple Accumulations", "[sparse simd avx5
     SKIP("Test only runs on x86_64 platforms");
 #endif
 }
+
+// Test that verifies the uniqueness invariant required by AVX512 scatter operations
+// The scatter instruction has undefined behavior if multiple lanes write to the same index,
+// but this is safe because posting lists guarantee unique doc_ids per term.
+TEST_CASE("Test Sparse SIMD AVX512 - Window Scatter Uniqueness Invariant", "[sparse simd avx512 window]") {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (!faiss::InstructionSet::GetInstance().AVX512F()) {
+        SKIP("AVX512 not available on this CPU");
+    }
+
+    const float tolerance = 0.0001f;
+
+    SECTION("Verify posting list uniqueness and window scatter correctness") {
+        // Create posting list data with guaranteed unique doc_ids (simulates real inverted index)
+        const uint32_t window_start = 1000;
+        const uint32_t window_size = 500;
+        const uint32_t window_end = window_start + window_size;
+
+        // Generate unique sorted doc_ids within the window range using std::set
+        std::set<uint32_t> unique_ids;
+        std::mt19937 rng(12345);
+        while (unique_ids.size() < 200) {
+            uint32_t id = window_start + (rng() % window_size);
+            unique_ids.insert(id);
+        }
+
+        std::vector<uint32_t> doc_ids(unique_ids.begin(), unique_ids.end());
+        std::vector<float> doc_vals(doc_ids.size());
+        for (size_t i = 0; i < doc_vals.size(); ++i) {
+            doc_vals[i] = static_cast<float>(rng() % 1000) / 100.0f;
+        }
+
+        // Verify uniqueness invariant - critical for AVX512 scatter correctness
+        std::set<uint32_t> uniqueness_check(doc_ids.begin(), doc_ids.end());
+        REQUIRE(uniqueness_check.size() == doc_ids.size());  // Must be unique
+
+        // Test window scatter with reference scalar implementation
+        const float q_weight = 2.5f;
+        std::vector<float> ref_scores(window_size, 0.0f);
+        std::vector<float> avx512_scores(window_size, 0.0f);
+
+        // Scalar reference: scores[doc_ids[i] - window_start] += q_weight * doc_vals[i]
+        for (size_t i = 0; i < doc_ids.size(); ++i) {
+            uint32_t local_id = doc_ids[i] - window_start;
+            ref_scores[local_id] += q_weight * doc_vals[i];
+        }
+
+        // AVX512 implementation
+        accumulate_window_ip_avx512(doc_ids.data(), doc_vals.data(), 0, doc_ids.size(), q_weight, avx512_scores.data(),
+                                    window_start);
+
+        // Verify results match
+        for (size_t i = 0; i < window_size; ++i) {
+            if (std::abs(ref_scores[i]) < 1e-6f && std::abs(avx512_scores[i]) < 1e-6f) {
+                continue;
+            }
+            REQUIRE_THAT(avx512_scores[i], Catch::Matchers::WithinRel(ref_scores[i], tolerance));
+        }
+    }
+
+    SECTION("Window scatter with partial range") {
+        // Test list_start and list_end parameters (partial posting list processing)
+        const uint32_t window_start = 500;
+        const uint32_t window_size = 300;
+
+        std::set<uint32_t> unique_ids;
+        std::mt19937 rng(67890);
+        while (unique_ids.size() < 150) {
+            uint32_t id = window_start + (rng() % window_size);
+            unique_ids.insert(id);
+        }
+
+        std::vector<uint32_t> doc_ids(unique_ids.begin(), unique_ids.end());
+        std::vector<float> doc_vals(doc_ids.size());
+        for (size_t i = 0; i < doc_vals.size(); ++i) {
+            doc_vals[i] = static_cast<float>(rng() % 1000) / 100.0f;
+        }
+
+        // Process only middle portion [50, 120)
+        const size_t list_start = 50;
+        const size_t list_end = 120;
+        const float q_weight = -1.7f;
+
+        std::vector<float> ref_scores(window_size, 0.0f);
+        std::vector<float> avx512_scores(window_size, 0.0f);
+
+        // Scalar reference for partial range
+        for (size_t i = list_start; i < list_end; ++i) {
+            uint32_t local_id = doc_ids[i] - window_start;
+            ref_scores[local_id] += q_weight * doc_vals[i];
+        }
+
+        // AVX512 with partial range
+        accumulate_window_ip_avx512(doc_ids.data(), doc_vals.data(), list_start, list_end, q_weight,
+                                    avx512_scores.data(), window_start);
+
+        for (size_t i = 0; i < window_size; ++i) {
+            if (std::abs(ref_scores[i]) < 1e-6f && std::abs(avx512_scores[i]) < 1e-6f) {
+                continue;
+            }
+            REQUIRE_THAT(avx512_scores[i], Catch::Matchers::WithinRel(ref_scores[i], tolerance));
+        }
+    }
+#else
+    SKIP("Test only runs on x86_64 platforms");
+#endif
+}
