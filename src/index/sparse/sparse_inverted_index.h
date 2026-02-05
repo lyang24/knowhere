@@ -1386,15 +1386,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Adaptive window size based on data density (avg nnz per document)
-        // Empirical findings:
-        //   - Sparse data (~25 nnz/doc): smaller windows (8K) are better
-        //   - Dense data (~127 nnz/doc): larger windows (128K+) are better
-        // Quadratic formula provides better scaling: window = avg_nnz² * 8
-        //   - 25 nnz/doc  → 25² * 8  = 5K  (close to optimal 8K)
-        //   - 127 nnz/doc → 127² * 8 = 129K (close to optimal 128K)
-        const size_t adaptive_window = static_cast<size_t>(avg_nnz_per_doc_ * avg_nnz_per_doc_ * 8);
-        const size_t WINDOW_SIZE = std::clamp(adaptive_window, static_cast<size_t>(8192), static_cast<size_t>(262144));
+        // Window size strategy based on metric type:
+        // - IP: No windowing (process all docs at once) - faster for both sparse and dense data
+        // - BM25: Fixed 64K window (256KB buffer fits in L2 cache)
+        const size_t WINDOW_SIZE = (metric_type_ == SparseMetricType::METRIC_IP) ? n_rows_internal_ : 65536;
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
