@@ -850,7 +850,17 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            // V2 requires AVX512 for SIMD acceleration; fall back to V1 without it
+#if defined(__x86_64__) || defined(_M_X64)
+            if (faiss::InstructionSet::GetInstance().AVX512F()) {
+                search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            } else {
+                search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            }
+#else
+            // Non-x86 platforms: fall back to V1
+            search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+#endif
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1550,7 +1560,17 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
+            // V2 requires AVX512 for SIMD acceleration; fall back to V1 without it
+#if defined(__x86_64__) || defined(_M_X64)
+            if (faiss::InstructionSet::GetInstance().AVX512F()) {
+                search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
+            } else {
+                search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
+            }
+#else
+            // Non-x86 platforms: fall back to V1
+            search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
+#endif
         } else {
             search_taat_naive(q_vec, heap, filter, computer);
         }
