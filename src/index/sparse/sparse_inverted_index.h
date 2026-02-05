@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <boost/core/span.hpp>
 #include <cmath>
 #include <filesystem>
@@ -361,6 +362,14 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             bm25_params_->row_sums_spans_ =
                 boost::span<const float>(bm25_params_->row_sums.data(), bm25_params_->row_sums.size());
         }
+
+        // Compute average nnz per document for adaptive window sizing in V2
+        // Sum of all posting list lengths = total nnz in index
+        size_t total_nnz = 0;
+        for (size_t i = 0; i < nr_inner_dims_; ++i) {
+            total_nnz += inverted_index_ids_spans_[i].size();
+        }
+        avg_nnz_per_doc_ = (n_rows_internal_ > 0) ? static_cast<float>(total_nnz) / n_rows_internal_ : 0.0f;
 
         return Status::success;
     }
@@ -1377,13 +1386,13 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size for batched processing - configurable via MAXSCORE_V2_WINDOW_SIZE macro
-        // Default 64K (256KB buffer) fits in L2 cache
-#ifdef MAXSCORE_V2_WINDOW_SIZE
-        constexpr size_t WINDOW_SIZE = MAXSCORE_V2_WINDOW_SIZE;
-#else
-        constexpr size_t WINDOW_SIZE = 65536;
-#endif
+        // Adaptive window size based on data density (avg nnz per document)
+        // Empirical findings:
+        //   - Sparse data (~25 nnz/doc): smaller windows (8K) are better
+        //   - Dense data (~127 nnz/doc): larger windows (128K+) are better
+        // Formula: window = avg_nnz * 1024, clamped to [8K, 256K]
+        const size_t adaptive_window = static_cast<size_t>(avg_nnz_per_doc_ * 1024);
+        const size_t WINDOW_SIZE = std::clamp(adaptive_window, static_cast<size_t>(8192), static_cast<size_t>(262144));
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
@@ -1698,6 +1707,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     size_t n_rows_internal_ = 0;
     size_t max_dim_ = 0;
     uint32_t next_dim_id_ = 0;
+    float avg_nnz_per_doc_ = 0.0f;  // Average non-zeros per document, used for adaptive window sizing
 
     char* map_ = nullptr;
     size_t map_byte_size_ = 0;
