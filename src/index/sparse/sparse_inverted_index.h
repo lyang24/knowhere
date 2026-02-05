@@ -1386,10 +1386,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size strategy based on metric type:
-        // - IP: No windowing (process all docs at once) - faster for both sparse and dense data
-        // - BM25: Fixed 64K window (256KB buffer fits in L2 cache)
-        const size_t WINDOW_SIZE = (metric_type_ == SparseMetricType::METRIC_IP) ? n_rows_internal_ : 65536;
+        // Window size strategy: No windowing for either metric
+        // Testing whether windowing helps BM25 on sparse data
+        const size_t WINDOW_SIZE = n_rows_internal_;
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
