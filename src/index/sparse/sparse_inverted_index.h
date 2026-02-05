@@ -858,10 +858,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 now uses distribution-aware term ordering (same as V1)
-            // The windowed SIMD scatter approach has been removed as it didn't provide
-            // consistent benefits across different data distributions.
-            search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            // V2 uses SIMD batch processing with distribution-aware term ordering
+            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1395,13 +1393,27 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
-        constexpr size_t WINDOW_SIZE = 65536;
+        // Very large window to process all docs in one batch (effectively no windowing)
+        constexpr size_t WINDOW_SIZE = 1000000;
 
-        // Sort query terms by contribution (max_score * query_weight) descending
-        std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-            return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
-        });
+        // Distribution-aware term ordering: sort by discriminative power
+        // Discriminative power = (max_score - avg_score) * query_weight
+        if (score_sum_in_dim_spans_.size() > 0) {
+            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                auto plist_len_a = inverted_index_ids_spans_[a.first].size();
+                auto plist_len_b = inverted_index_ids_spans_[b.first].size();
+                float avg_a = plist_len_a > 0 ? score_sum_in_dim_spans_[a.first] / plist_len_a : 0.0f;
+                float avg_b = plist_len_b > 0 ? score_sum_in_dim_spans_[b.first] / plist_len_b : 0.0f;
+                float disc_a = (max_score_in_dim_spans_[a.first] - avg_a) * a.second;
+                float disc_b = (max_score_in_dim_spans_[b.first] - avg_b) * b.second;
+                return disc_a > disc_b;
+            });
+        } else {
+            // Fallback for older indexes without score_sum_in_dim_
+            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
+            });
+        }
 
         // Build posting list info for each query term
         struct PostingListInfo {
@@ -1581,8 +1593,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 now uses distribution-aware term ordering (same as V1)
-            search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
+            // V2 uses SIMD batch processing with distribution-aware term ordering
+            search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, filter, computer);
         }
