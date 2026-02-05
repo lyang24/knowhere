@@ -277,4 +277,127 @@ extract_candidates_avx512(const float* scores, size_t window_size, float thresho
     return num_candidates;
 }
 
+// ============================================================================
+// AVX512 BM25 SIMD Accumulation
+// ============================================================================
+// Accumulates BM25 contributions: scores[doc_id] += q_weight * BM25(tf, doc_len)
+// where BM25(tf, doc_len) = tf * (k1 + 1) / (tf + k1 * (1 - b + b * doc_len/avgdl))
+//
+// Parameters:
+//   doc_ids: posting list document IDs
+//   term_freqs: term frequencies (float)
+//   doc_lens: document lengths for each document (raw lengths, NOT ratios)
+//   list_size: number of elements in posting list
+//   q_weight: query term weight
+//   k1, b, avgdl: BM25 parameters
+//   scores: output score buffer (indexed by doc_id)
+void
+accumulate_bm25_avx512(const uint32_t* doc_ids, const float* term_freqs, const float* doc_lens, size_t list_size,
+                       float q_weight, float k1, float b, float avgdl, float* scores) {
+    constexpr size_t SIMD_WIDTH = 16;
+    size_t j = 0;
+
+    // Broadcast constants
+    __m512 q_weight_vec = _mm512_set1_ps(q_weight);
+    __m512 k1_vec = _mm512_set1_ps(k1);
+    __m512 k1_plus_1_vec = _mm512_set1_ps(k1 + 1.0f);
+    __m512 b_vec = _mm512_set1_ps(b);
+    __m512 one_minus_b_vec = _mm512_set1_ps(1.0f - b);
+    __m512 inv_avgdl_vec = _mm512_set1_ps(1.0f / avgdl);  // Multiply by reciprocal is faster than divide
+
+    // Main SIMD loop
+    for (; j + SIMD_WIDTH <= list_size; j += SIMD_WIDTH) {
+        // Load doc IDs and term frequencies
+        __m512i ids = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(&doc_ids[j]));
+        __m512 tf = _mm512_loadu_ps(&term_freqs[j]);
+
+        // Gather doc_lens for these documents and compute ratio
+        __m512 doc_len = _mm512_i32gather_ps(ids, doc_lens, sizeof(float));
+        __m512 len_ratio = _mm512_mul_ps(doc_len, inv_avgdl_vec);  // doc_len / avgdl
+
+        // Compute BM25: tf * (k1 + 1) / (tf + k1 * (1 - b + b * len_ratio))
+        // numerator = tf * (k1 + 1)
+        __m512 numerator = _mm512_mul_ps(tf, k1_plus_1_vec);
+
+        // denominator = tf + k1 * (1 - b + b * len_ratio)
+        __m512 len_term = _mm512_fmadd_ps(b_vec, len_ratio, one_minus_b_vec);  // (1-b) + b*len_ratio
+        __m512 denom = _mm512_fmadd_ps(k1_vec, len_term, tf);                  // tf + k1*len_term
+
+        // bm25_score = numerator / denominator
+        __m512 bm25_score = _mm512_div_ps(numerator, denom);
+
+        // weighted_score = q_weight * bm25_score
+        __m512 weighted_score = _mm512_mul_ps(q_weight_vec, bm25_score);
+
+        // Gather current scores, add, scatter back
+        __m512 current_scores = _mm512_i32gather_ps(ids, scores, sizeof(float));
+        __m512 new_scores = _mm512_add_ps(current_scores, weighted_score);
+        _mm512_i32scatter_ps(scores, ids, new_scores, sizeof(float));
+    }
+
+    // Scalar tail
+    for (; j < list_size; ++j) {
+        uint32_t doc_id = doc_ids[j];
+        float tf = term_freqs[j];
+        float len_ratio = doc_lens[doc_id] / avgdl;
+        float bm25 = tf * (k1 + 1.0f) / (tf + k1 * (1.0f - b + b * len_ratio));
+        scores[doc_id] += q_weight * bm25;
+    }
+}
+
+// Windowed version for batched MaxScore
+void
+accumulate_window_bm25_avx512(const uint32_t* doc_ids, const float* term_freqs, const float* doc_lens,
+                              size_t list_start, size_t list_end, float q_weight, float k1, float b, float avgdl,
+                              float* scores, uint32_t window_start) {
+    constexpr size_t SIMD_WIDTH = 16;
+
+    // Broadcast constants
+    __m512 q_weight_vec = _mm512_set1_ps(q_weight);
+    __m512 k1_vec = _mm512_set1_ps(k1);
+    __m512 k1_plus_1_vec = _mm512_set1_ps(k1 + 1.0f);
+    __m512 b_vec = _mm512_set1_ps(b);
+    __m512 one_minus_b_vec = _mm512_set1_ps(1.0f - b);
+    __m512 inv_avgdl_vec = _mm512_set1_ps(1.0f / avgdl);
+    __m512i window_start_vec = _mm512_set1_epi32(static_cast<int32_t>(window_start));
+
+    size_t j = list_start;
+
+    // Main SIMD loop
+    for (; j + SIMD_WIDTH <= list_end; j += SIMD_WIDTH) {
+        // Load doc IDs and term frequencies
+        __m512i ids = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(&doc_ids[j]));
+        __m512 tf = _mm512_loadu_ps(&term_freqs[j]);
+
+        // Gather doc_lens for these documents and compute ratio
+        __m512 doc_len = _mm512_i32gather_ps(ids, doc_lens, sizeof(float));
+        __m512 len_ratio = _mm512_mul_ps(doc_len, inv_avgdl_vec);  // doc_len / avgdl
+
+        // Compute BM25: tf * (k1 + 1) / (tf + k1 * (1 - b + b * len_ratio))
+        __m512 numerator = _mm512_mul_ps(tf, k1_plus_1_vec);
+        __m512 len_term = _mm512_fmadd_ps(b_vec, len_ratio, one_minus_b_vec);
+        __m512 denom = _mm512_fmadd_ps(k1_vec, len_term, tf);
+        __m512 bm25_score = _mm512_div_ps(numerator, denom);
+        __m512 weighted_score = _mm512_mul_ps(q_weight_vec, bm25_score);
+
+        // Convert to window-relative indices
+        __m512i local_ids = _mm512_sub_epi32(ids, window_start_vec);
+
+        // Gather current scores, add, scatter back
+        __m512 current_scores = _mm512_i32gather_ps(local_ids, scores, sizeof(float));
+        __m512 new_scores = _mm512_add_ps(current_scores, weighted_score);
+        _mm512_i32scatter_ps(scores, local_ids, new_scores, sizeof(float));
+    }
+
+    // Scalar tail
+    for (; j < list_end; ++j) {
+        uint32_t doc_id = doc_ids[j];
+        uint32_t local_id = doc_id - window_start;
+        float tf = term_freqs[j];
+        float len_ratio = doc_lens[doc_id] / avgdl;
+        float bm25 = tf * (k1 + 1.0f) / (tf + k1 * (1.0f - b + b * len_ratio));
+        scores[local_id] += q_weight * bm25;
+    }
+}
+
 }  // namespace knowhere::sparse

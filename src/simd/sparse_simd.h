@@ -30,6 +30,18 @@ simd_seek_avx512_impl(const uint32_t* __restrict__ ids, size_t size, size_t star
 // candidates array must have space for at least window_size elements
 size_t
 extract_candidates_avx512(const float* scores, size_t window_size, float threshold, uint32_t* candidates);
+
+// AVX512 BM25 SIMD accumulation
+// scores[doc_id] += q_weight * BM25(tf, doc_len/avgdl)
+void
+accumulate_bm25_avx512(const uint32_t* doc_ids, const float* term_freqs, const float* doc_lens, size_t list_size,
+                       float q_weight, float k1, float b, float avgdl, float* scores);
+
+// Windowed version for batched MaxScore
+void
+accumulate_window_bm25_avx512(const uint32_t* doc_ids, const float* term_freqs, const float* doc_lens,
+                              size_t list_start, size_t list_end, float q_weight, float k1, float b, float avgdl,
+                              float* scores, uint32_t window_start);
 #endif
 
 // Scalar seek implementation (fallback)
@@ -127,6 +139,61 @@ extract_candidates_dispatch(const float* scores, size_t window_size, float thres
     }
 #endif
     return extract_candidates_scalar(scores, window_size, threshold, candidates);
+}
+
+// ============================================================================
+// BM25 SIMD Dispatch Functions
+// ============================================================================
+
+// Dispatch function for BM25 accumulation with runtime CPU detection
+template <typename QType>
+inline void
+accumulate_bm25_dispatch(const uint32_t* doc_ids, const QType* term_freqs, const float* doc_lens, size_t list_size,
+                         float q_weight, float k1, float b, float avgdl, float* scores) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if constexpr (std::is_same_v<QType, float>) {
+        if (faiss::InstructionSet::GetInstance().AVX512F()) {
+            accumulate_bm25_avx512(doc_ids, term_freqs, doc_lens, list_size, q_weight, k1, b, avgdl, scores);
+            return;
+        }
+    }
+#endif
+
+    // Scalar fallback for BM25 computation
+    for (size_t i = 0; i < list_size; ++i) {
+        uint32_t doc_id = doc_ids[i];
+        float tf = static_cast<float>(term_freqs[i]);
+        float len_ratio = doc_lens[doc_id] / avgdl;
+        float bm25 = tf * (k1 + 1.0f) / (tf + k1 * (1.0f - b + b * len_ratio));
+        scores[doc_id] += q_weight * bm25;
+    }
+}
+
+// Dispatch function for windowed BM25 accumulation
+template <typename QType>
+inline void
+accumulate_window_bm25_dispatch(const uint32_t* doc_ids, const QType* term_freqs, const float* doc_lens,
+                                size_t list_start, size_t list_end, float q_weight, float k1, float b, float avgdl,
+                                float* scores, uint32_t window_start) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if constexpr (std::is_same_v<QType, float>) {
+        if (faiss::InstructionSet::GetInstance().AVX512F()) {
+            accumulate_window_bm25_avx512(doc_ids, term_freqs, doc_lens, list_start, list_end, q_weight, k1, b, avgdl,
+                                          scores, window_start);
+            return;
+        }
+    }
+#endif
+
+    // Scalar fallback
+    for (size_t j = list_start; j < list_end; ++j) {
+        uint32_t doc_id = doc_ids[j];
+        uint32_t local_id = doc_id - window_start;
+        float tf = static_cast<float>(term_freqs[j]);
+        float len_ratio = doc_lens[doc_id] / avgdl;
+        float bm25 = tf * (k1 + 1.0f) / (tf + k1 * (1.0f - b + b * len_ratio));
+        scores[local_id] += q_weight * bm25;
+    }
 }
 
 }  // namespace knowhere::sparse

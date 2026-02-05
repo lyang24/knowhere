@@ -1462,14 +1462,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                         sparse::accumulate_window_ip_dispatch(ids, vals, list_start, list_end, pl.q_weight,
                                                               scores.data(), window_start);
                     } else {
-                        // Scalar loop for BM25 metric (requires computer function)
-                        const auto& doc_len_ratios = bm25_params_->row_sums_spans_;
-                        for (size_t j = list_start; j < list_end; ++j) {
-                            const auto doc_id = ids[j];
-                            const uint32_t local_id = doc_id - window_start;
-                            scores[local_id] +=
-                                pl.q_weight * computer(static_cast<float>(vals[j]), doc_len_ratios[doc_id]);
-                        }
+                        // SIMD batch accumulate for BM25 metric
+                        const float* doc_lens = bm25_params_->row_sums_spans_.data();
+                        sparse::accumulate_window_bm25_dispatch(ids, vals, doc_lens, list_start, list_end, pl.q_weight,
+                                                                bm25_params_->k1, bm25_params_->b, bm25_params_->avgdl,
+                                                                scores.data(), window_start);
                     }
                 }
             }
