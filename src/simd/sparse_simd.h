@@ -103,12 +103,14 @@ inline void
 accumulate_window_ip_dispatch(const uint32_t* doc_ids, const QType* doc_vals, size_t list_start, size_t list_end,
                               float q_weight, float* scores, uint32_t window_start) {
 #if defined(__x86_64__) || defined(_M_X64)
+#ifndef DISABLE_SIMD_V2  // For benchmarking: define DISABLE_SIMD_V2 to use scalar fallback
     if constexpr (std::is_same_v<QType, float>) {
         if (faiss::InstructionSet::GetInstance().AVX512F()) {
             accumulate_window_ip_avx512(doc_ids, doc_vals, list_start, list_end, q_weight, scores, window_start);
             return;
         }
     }
+#endif
 #endif
 
     // Scalar fallback
@@ -134,9 +136,11 @@ extract_candidates_scalar(const float* scores, size_t window_size, float thresho
 inline size_t
 extract_candidates_dispatch(const float* scores, size_t window_size, float threshold, uint32_t* candidates) {
 #if defined(__x86_64__) || defined(_M_X64)
+#ifndef DISABLE_SIMD_V2  // For benchmarking: define DISABLE_SIMD_V2 to use scalar fallback
     if (faiss::InstructionSet::GetInstance().AVX512F()) {
         return extract_candidates_avx512(scores, window_size, threshold, candidates);
     }
+#endif
 #endif
     return extract_candidates_scalar(scores, window_size, threshold, candidates);
 }
@@ -176,6 +180,7 @@ accumulate_window_bm25_dispatch(const uint32_t* doc_ids, const QType* term_freqs
                                 size_t list_start, size_t list_end, float q_weight, float k1, float b, float avgdl,
                                 float* scores, uint32_t window_start) {
 #if defined(__x86_64__) || defined(_M_X64)
+#ifndef DISABLE_SIMD_V2  // For benchmarking: define DISABLE_SIMD_V2 to use scalar fallback
     if constexpr (std::is_same_v<QType, float>) {
         if (faiss::InstructionSet::GetInstance().AVX512F()) {
             accumulate_window_bm25_avx512(doc_ids, term_freqs, doc_lens, list_start, list_end, q_weight, k1, b, avgdl,
@@ -183,6 +188,7 @@ accumulate_window_bm25_dispatch(const uint32_t* doc_ids, const QType* term_freqs
             return;
         }
     }
+#endif
 #endif
 
     // Scalar fallback
