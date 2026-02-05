@@ -1681,6 +1681,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     struct BM25Params {
         float k1;
         float b;
+        float avgdl;
         // row_sums is used to cache the sum of values of each row, which
         // corresponds to the document length of each doc in the BM25 formula.
         Vector<float> row_sums;
@@ -1689,7 +1690,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         DocValueComputer<float> max_score_computer;
 
         BM25Params(float k1, float b, float avgdl)
-            : k1(k1), b(b), max_score_computer(GetDocValueBM25Computer<float>(k1, b, avgdl)) {
+            : k1(k1), b(b), avgdl(avgdl), max_score_computer(GetDocValueBM25Computer<float>(k1, b, avgdl)) {
         }
     };  // struct BM25Params
 
