@@ -1367,8 +1367,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size for batched processing (64K docs * 4 bytes = 256KB, fits in L2/L3 cache)
-        constexpr size_t WINDOW_SIZE = 65536;
+        // No windowing - process all documents at once for maximum SIMD efficiency
+        // This uses more memory (n_rows * 4 bytes) but avoids window boundary overhead
+        const size_t WINDOW_SIZE = n_rows_internal_;
 
         // Sort query terms by contribution (max_score * query_weight) descending
         std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
