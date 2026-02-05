@@ -129,16 +129,39 @@ struct GroundTruth {
         if (query_idx >= nq)
             return 0.0f;
         int64_t check_k = std::min(result_k, k);
+
+        // Count valid (non -1) entries in GT
+        int64_t valid_gt = 0;
+        for (int64_t j = 0; j < check_k; ++j) {
+            if (gt[query_idx][j] != -1) {
+                valid_gt++;
+            }
+        }
+
+        // If GT has no valid entries, return 1.0 if results also has no valid entries
+        if (valid_gt == 0) {
+            for (int64_t i = 0; i < check_k; ++i) {
+                if (results[i] != -1)
+                    return 0.0f;  // GT empty but results non-empty
+            }
+            return 1.0f;  // Both empty
+        }
+
+        // Count matches (only for valid GT entries, skip -1 in both)
         int matches = 0;
         for (int64_t i = 0; i < check_k; ++i) {
+            if (results[i] == -1)
+                continue;  // Skip invalid results
             for (int64_t j = 0; j < check_k; ++j) {
+                if (gt[query_idx][j] == -1)
+                    continue;  // Skip invalid GT entries
                 if (results[i] == gt[query_idx][j]) {
                     matches++;
                     break;
                 }
             }
         }
-        return static_cast<float>(matches) / check_k;
+        return static_cast<float>(matches) / valid_gt;
     }
 };
 

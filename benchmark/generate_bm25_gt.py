@@ -65,7 +65,7 @@ def generate_ground_truth(base_path, query_path, output_path, k=10, k1=1.2, b=0.
     print(f"  Avg doc length: {actual_avgdl:.2f} (using {avgdl} for BM25)")
 
     print(f"Computing BM25 scores for {n_queries} queries (brute force)...")
-    ground_truth = np.zeros((n_queries, k), dtype=np.int32)
+    ground_truth = np.full((n_queries, k), -1, dtype=np.int32)  # Initialize with -1 for padding
 
     for q in range(n_queries):
         if (q + 1) % 100 == 0:
@@ -87,9 +87,27 @@ def generate_ground_truth(base_path, query_path, output_path, k=10, k1=1.2, b=0.
                 doc_lens[d], avgdl, k1, b
             )
 
-        # Get top-k indices
-        top_k_indices = np.argsort(scores)[-k:][::-1]
-        ground_truth[q] = top_k_indices
+        # Get top-k indices, excluding zero-score docs
+        # Knowhere MaxScore only considers docs with query-term overlap (score > 0)
+        # If fewer than k matches, pad with -1
+        nonzero_mask = scores > 0
+        nonzero_indices = np.where(nonzero_mask)[0]
+        nonzero_scores = scores[nonzero_mask]
+
+        if len(nonzero_indices) == 0:
+            # No matches - fill with -1
+            ground_truth[q] = -1
+        else:
+            # Sort by (score desc, doc_id asc) for deterministic tie-breaking
+            sort_order = np.lexsort((nonzero_indices, -nonzero_scores))
+            sorted_indices = nonzero_indices[sort_order]
+
+            if len(sorted_indices) >= k:
+                ground_truth[q] = sorted_indices[:k]
+            else:
+                # Fewer than k matches - pad with -1
+                ground_truth[q, :len(sorted_indices)] = sorted_indices
+                ground_truth[q, len(sorted_indices):] = -1
 
     print(f"Saving ground truth to {output_path}...")
     with open(output_path, 'wb') as f:
