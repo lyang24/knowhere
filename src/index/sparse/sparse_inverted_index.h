@@ -357,6 +357,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             max_score_in_dim_spans_ = boost::span<const float>(max_score_in_dim_.data(), max_score_in_dim_.size());
         }
 
+        if (score_sum_in_dim_.size() > 0) {
+            score_sum_in_dim_spans_ = boost::span<const float>(score_sum_in_dim_.data(), score_sum_in_dim_.size());
+        }
+
         if (metric_type_ == SparseMetricType::METRIC_BM25) {
             bm25_params_->row_sums_spans_ =
                 boost::span<const float>(bm25_params_->row_sums.data(), bm25_params_->row_sums.size());
@@ -819,6 +823,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 max_score_in_dim_spans_ = boost::span<const float>(max_score_in_dim_.data(), max_score_in_dim_.size());
             }
 
+            if (score_sum_in_dim_.size() > 0) {
+                score_sum_in_dim_spans_ = boost::span<const float>(score_sum_in_dim_.data(), score_sum_in_dim_.size());
+            }
+
             if (metric_type_ == SparseMetricType::METRIC_BM25) {
                 bm25_params_->row_sums_spans_ =
                     boost::span<const float>(bm25_params_->row_sums.data(), bm25_params_->row_sums.size());
@@ -850,7 +858,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            // V2 now uses distribution-aware term ordering (same as V1)
+            // The windowed SIMD scatter approach has been removed as it didn't provide
+            // consistent benefits across different data distributions.
+            search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1271,9 +1282,26 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                          const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-            return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
-        });
+        // Distribution-aware term ordering: sort by discriminative power rather than just max_score.
+        // Discriminative power = (max_score - avg_score) * query_weight
+        // A term with high max_score but low avg_score is more discriminative and helps
+        // establish a tighter threshold early, enabling more aggressive pruning.
+        if (score_sum_in_dim_spans_.size() > 0) {
+            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                auto plist_len_a = inverted_index_ids_spans_[a.first].size();
+                auto plist_len_b = inverted_index_ids_spans_[b.first].size();
+                float avg_a = plist_len_a > 0 ? score_sum_in_dim_spans_[a.first] / plist_len_a : 0.0f;
+                float avg_b = plist_len_b > 0 ? score_sum_in_dim_spans_[b.first] / plist_len_b : 0.0f;
+                float disc_a = (max_score_in_dim_spans_[a.first] - avg_a) * a.second;
+                float disc_b = (max_score_in_dim_spans_[b.first] - avg_b) * b.second;
+                return disc_a > disc_b;
+            });
+        } else {
+            // Fallback for older indexes without score_sum_in_dim_
+            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
+            });
+        }
 
         std::vector<Cursor<DocIdFilter>> cursors = make_cursors(q_vec, computer, filter, dim_max_score_ratio);
 
@@ -1553,7 +1581,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
+            // V2 now uses distribution-aware term ordering (same as V1)
+            search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, filter, computer);
         }
@@ -1610,6 +1639,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 if constexpr (algo == InvertedIndexAlgo::DAAT_WAND || algo == InvertedIndexAlgo::DAAT_MAXSCORE ||
                               algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
                     max_score_in_dim_.emplace_back(0.0f);
+                    score_sum_in_dim_.emplace_back(0.0f);
                 }
             }
             // vec_id is unique per document, so each posting list entry is unique
@@ -1636,6 +1666,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                     score = bm25_params_->max_score_computer(val, row_sum);
                 }
                 max_score_in_dim_[dim_it->second] = std::max(max_score_in_dim_[dim_it->second], score);
+                score_sum_in_dim_[dim_it->second] += score;
             }
         }
         if (metric_type_ == SparseMetricType::METRIC_BM25) {
@@ -1670,6 +1701,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     std::vector<boost::span<const QType>> inverted_index_vals_spans_;
     Vector<float> max_score_in_dim_;
     boost::span<const float> max_score_in_dim_spans_;
+
+    // Sum of scores per dimension for distribution-aware term ordering.
+    // Combined with posting list length, gives average score for discriminative power calculation.
+    Vector<float> score_sum_in_dim_;
+    boost::span<const float> score_sum_in_dim_spans_;
 
     SparseMetricType metric_type_;
 
