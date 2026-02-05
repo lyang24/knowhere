@@ -1390,8 +1390,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         // Empirical findings:
         //   - Sparse data (~25 nnz/doc): smaller windows (8K) are better
         //   - Dense data (~127 nnz/doc): larger windows (128K+) are better
-        // Formula: window = avg_nnz * 1024, clamped to [8K, 256K]
-        const size_t adaptive_window = static_cast<size_t>(avg_nnz_per_doc_ * 1024);
+        // Quadratic formula provides better scaling: window = avg_nnz² * 8
+        //   - 25 nnz/doc  → 25² * 8  = 5K  (close to optimal 8K)
+        //   - 127 nnz/doc → 127² * 8 = 129K (close to optimal 128K)
+        const size_t adaptive_window = static_cast<size_t>(avg_nnz_per_doc_ * avg_nnz_per_doc_ * 8);
         const size_t WINDOW_SIZE = std::clamp(adaptive_window, static_cast<size_t>(8192), static_cast<size_t>(262144));
 
         // Sort query terms by contribution (max_score * query_weight) descending
