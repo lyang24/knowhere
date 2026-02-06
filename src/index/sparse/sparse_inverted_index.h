@@ -889,19 +889,9 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 with SIMD is only beneficial for dense data (IP metric on SPLADE embeddings).
-            // For BM25 on sparse tokenized data, V1 is faster due to better early termination.
-            // V2 also requires AVX512; fall back to V1 without it.
-#if defined(__x86_64__) || defined(_M_X64)
-            if (metric_type_ == SparseMetricType::METRIC_IP && faiss::InstructionSet::GetInstance().AVX512F()) {
-                search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
-            } else {
-                search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
-            }
-#else
-            // Non-x86 platforms: fall back to V1
-            search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
-#endif
+            // V2 uses impact/cost ordering: prioritizes rare high-impact terms.
+            // This is beneficial for both IP and BM25 on sparse data.
+            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1426,168 +1416,99 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    // MaxScore v2: Batched MaxScore with SIMD scatter-gather accumulation
-    // Process each posting list's contributions in batches rather than alternating
-    // between iterators. This enables:
-    // - Better memory locality (prefetcher works on sequential access)
-    // - Better branch prediction (consistent pattern per posting list)
-    // - SIMD vectorization (AVX512 scatter-gather for batch accumulation)
+    // MaxScore v2: IDF-weighted discrimination ordering.
+    // priority = IDF * UB = log(N/df) * max_score * query_weight
+    // - IDF captures term rarity (rare terms are more discriminative)
+    // - UB captures impact (high-scoring terms contribute more)
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                             const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Window size strategy: No windowing for either metric
-        // Testing whether windowing helps BM25 on sparse data
-        const size_t WINDOW_SIZE = n_rows_internal_;
-
-        // Sort query terms by contribution (max_score * query_weight) descending
-        std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-            return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
+        const float n_docs = static_cast<float>(n_rows_internal_);
+        std::sort(q_vec.begin(), q_vec.end(), [this, n_docs](auto& a, auto& b) {
+            size_t df_a = inverted_index_ids_spans_[a.first].size();
+            size_t df_b = inverted_index_ids_spans_[b.first].size();
+            // IDF = log(N / df), but we use log(N / df + 1) to avoid log(inf) for df=0
+            float idf_a = std::log(n_docs / (df_a + 1.0f));
+            float idf_b = std::log(n_docs / (df_b + 1.0f));
+            float ub_a = max_score_in_dim_spans_[a.first] * a.second;
+            float ub_b = max_score_in_dim_spans_[b.first] * b.second;
+            return idf_a * ub_a > idf_b * ub_b;
         });
 
-        // Build posting list info for each query term
-        struct PostingListInfo {
-            float q_weight;
-            float max_score;
-            boost::span<const table_t> ids;
-            boost::span<const QType> vals;
-        };
-        std::vector<PostingListInfo> posting_lists;
-        posting_lists.reserve(q_vec.size());
-
-        for (auto& [inner_dim, q_weight] : q_vec) {
-            auto plist_ids = inverted_index_ids_spans_[inner_dim];
-            auto plist_vals = inverted_index_vals_spans_[inner_dim];
-            if (plist_ids.empty())
-                continue;
-
-            float max_score = max_score_in_dim_spans_[inner_dim] * static_cast<float>(q_weight) * dim_max_score_ratio;
-            posting_lists.push_back({static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
-        }
-
-        if (posting_lists.empty())
-            return;
-
-        // Compute suffix sums for pruning (upper bounds)
-        std::vector<float> upper_bounds(posting_lists.size());
-        float bound_sum = 0.0f;
-        for (size_t i = posting_lists.size(); i > 0; --i) {
-            bound_sum += posting_lists[i - 1].max_score;
-            upper_bounds[i - 1] = bound_sum;
-        }
+        std::vector<Cursor<DocIdFilter>> cursors = make_cursors(q_vec, computer, filter, dim_max_score_ratio);
 
         float threshold = heap.full() ? heap.top().val : 0;
 
-        // Allocate window score buffer (aligned for SIMD)
-        std::vector<float> scores(WINDOW_SIZE);
+        std::vector<float> upper_bounds(cursors.size());
+        float bound_sum = 0.0;
+        for (size_t i = cursors.size() - 1; i + 1 > 0; --i) {
+            bound_sum += cursors[i].max_score_;
+            upper_bounds[i] = bound_sum;
+        }
 
-        // Candidate indices buffer for SIMD extraction (worst case: all docs are candidates)
-        std::vector<uint32_t> candidate_indices(WINDOW_SIZE);
-
-        // Track current position in each posting list (for cursor advancement across windows)
-        std::vector<size_t> cursors(posting_lists.size(), 0);
-
-        // Process documents in windows
-        for (table_t window_start = 0; window_start < n_rows_internal_; window_start += WINDOW_SIZE) {
-            table_t window_end =
-                std::min(static_cast<table_t>(window_start + WINDOW_SIZE), static_cast<table_t>(n_rows_internal_));
-            size_t window_size = window_end - window_start;
-
-            // Reset scores for this window
-            std::memset(scores.data(), 0, window_size * sizeof(float));
-
-            // Find essential/non-essential split based on current threshold
-            size_t first_ne_idx = posting_lists.size();
-            while (first_ne_idx > 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
-                --first_ne_idx;
+        table_t next_cand_vec_id = n_rows_internal_;
+        for (size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
+                next_cand_vec_id = cursors[i].cur_vec_id_;
             }
-            if (first_ne_idx == 0)
-                break;  // No more candidates possible
+        }
 
-            // BATCH PROCESS each essential posting list
-            // Process all contributions from one posting list before moving to the next,
-            // enabling CPU prefetcher and SIMD
-            for (size_t i = 0; i < first_ne_idx; ++i) {
-                auto& pl = posting_lists[i];
-                const table_t* ids = pl.ids.data();
-                const QType* vals = pl.vals.data();
-                size_t pl_size = pl.ids.size();
+        size_t first_ne_idx = cursors.size();
 
-                // Advance cursor to first element >= window_start
-                while (cursors[i] < pl_size && ids[cursors[i]] < window_start) {
-                    cursors[i]++;
-                }
-                size_t list_start = cursors[i];
-
-                // Find end position (first element >= window_end)
-                size_t list_end = list_start;
-                while (list_end < pl_size && ids[list_end] < window_end) {
-                    list_end++;
-                }
-
-                if (list_start < list_end) {
-                    if (metric_type_ == SparseMetricType::METRIC_IP) {
-                        // SIMD batch accumulate for IP metric
-                        // scores[doc_id - window_start] += q_weight * val
-                        sparse::accumulate_window_ip_dispatch(ids, vals, list_start, list_end, pl.q_weight,
-                                                              scores.data(), window_start);
-                    } else {
-                        // SIMD batch accumulate for BM25 metric
-                        const float* doc_lens = bm25_params_->row_sums_spans_.data();
-                        sparse::accumulate_window_bm25_dispatch(ids, vals, doc_lens, list_start, list_end, pl.q_weight,
-                                                                bm25_params_->k1, bm25_params_->b, bm25_params_->avgdl,
-                                                                scores.data(), window_start);
-                    }
-                }
+        while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
+            --first_ne_idx;
+            if (first_ne_idx == 0) {
+                return;
             }
+        }
 
-            // Calculate max possible contribution from non-essential terms
-            float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
+        float curr_cand_score = 0.0f;
+        table_t curr_cand_vec_id = 0;
 
-            // SIMD candidate extraction: find all docs where score > effective_threshold
-            // effective_threshold = max(0, threshold - ne_upper_bound)
-            // This combines two checks: score > 0 AND score + ne_upper_bound > threshold
-            float effective_threshold = std::max(0.0f, threshold - ne_upper_bound);
-            size_t num_candidates = sparse::extract_candidates_dispatch(scores.data(), window_size, effective_threshold,
-                                                                        candidate_indices.data());
-
-            // Process extracted candidates
-            for (size_t c = 0; c < num_candidates; ++c) {
-                uint32_t doc_offset = candidate_indices[c];
-                float score = scores[doc_offset];
-
-                table_t doc_id = window_start + static_cast<table_t>(doc_offset);
-                if (!filter.empty() && filter.test(doc_id))
-                    continue;
-
-                // Add contributions from non-essential terms
-                // (These are terms whose max contribution alone can't beat threshold,
-                // but might contribute when combined with essential terms)
-                float full_score = score;
+        while (curr_cand_vec_id < n_rows_internal_) {
+            auto found_cand = false;
+            while (found_cand == false) {
+                if (next_cand_vec_id >= n_rows_internal_) {
+                    return;
+                }
+                curr_cand_vec_id = next_cand_vec_id;
+                curr_cand_score = 0.0f;
+                next_cand_vec_id = n_rows_internal_;
                 float cur_vec_sum =
-                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[doc_id] : 0;
+                    metric_type_ == SparseMetricType::METRIC_BM25 ? bm25_params_->row_sums_spans_[curr_cand_vec_id] : 0;
 
-                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
-                    // Early termination if we can't beat threshold
-                    if (full_score + upper_bounds[i] <= threshold)
-                        break;
-
-                    auto& pl = posting_lists[i];
-                    const table_t* ids = pl.ids.data();
-                    const QType* vals = pl.vals.data();
-                    size_t pl_size = pl.ids.size();
-
-                    // Binary search for doc_id in this posting list
-                    auto it = std::lower_bound(ids, ids + pl_size, doc_id);
-                    if (it != ids + pl_size && *it == doc_id) {
-                        size_t idx = it - ids;
-                        full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), cur_vec_sum);
+                for (size_t i = 0; i < first_ne_idx; ++i) {
+                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
+                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
+                        cursors[i].next();
+                    }
+                    if (cursors[i].cur_vec_id_ < next_cand_vec_id) {
+                        next_cand_vec_id = cursors[i].cur_vec_id_;
                     }
                 }
 
-                if (full_score > threshold) {
-                    heap.push(doc_id, full_score);
-                    threshold = heap.full() ? heap.top().val : 0;
+                found_cand = true;
+                for (size_t i = first_ne_idx; i < cursors.size(); ++i) {
+                    if (curr_cand_score + upper_bounds[i] <= threshold) {
+                        found_cand = false;
+                        break;
+                    }
+                    cursors[i].seek(curr_cand_vec_id);
+                    if (cursors[i].cur_vec_id_ == curr_cand_vec_id) {
+                        curr_cand_score += cursors[i].q_value_ * computer(cursors[i].cur_vec_val(), cur_vec_sum);
+                    }
+                }
+            }
+
+            if (curr_cand_score > threshold) {
+                heap.push(curr_cand_vec_id, curr_cand_score);
+                threshold = heap.full() ? heap.top().val : 0;
+                while (first_ne_idx != 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
+                    --first_ne_idx;
+                    if (first_ne_idx == 0) {
+                        return;
+                    }
                 }
             }
         }
@@ -1620,19 +1541,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
             search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 with SIMD is only beneficial for dense data (IP metric on SPLADE embeddings).
-            // For BM25 on sparse tokenized data, V1 is faster due to better early termination.
-            // V2 also requires AVX512; fall back to V1 without it.
-#if defined(__x86_64__) || defined(_M_X64)
-            if (metric_type_ == SparseMetricType::METRIC_IP && faiss::InstructionSet::GetInstance().AVX512F()) {
-                search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
-            } else {
-                search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
-            }
-#else
-            // Non-x86 platforms: fall back to V1
-            search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
-#endif
+            // V2 uses impact/cost ordering: prioritizes rare high-impact terms.
+            search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, filter, computer);
         }
