@@ -856,10 +856,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         if constexpr (algo == InvertedIndexAlgo::DAAT_WAND) {
             search_daat_wand(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
-            search_daat_maxscore(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            // V1: Original MaxScore with max_score * query_weight sorting
+            search_daat_maxscore<false>(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 uses SIMD batch processing with distribution-aware term ordering
-            search_daat_maxscore_v2(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
+            // V2: MaxScore with distribution-aware term ordering
+            search_daat_maxscore<true>(q_vec, heap, bitset, computer, approx_params.dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, bitset, computer);
         }
@@ -1276,26 +1277,33 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         }
     }
 
-    template <typename DocIdFilter>
+    template <bool use_dist_aware, typename DocIdFilter>
     void
     search_daat_maxscore(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                          const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Distribution-aware term ordering: sort by discriminative power rather than just max_score.
-        // Discriminative power = (max_score - avg_score) * query_weight
-        // A term with high max_score but low avg_score is more discriminative and helps
-        // establish a tighter threshold early, enabling more aggressive pruning.
-        if (score_sum_in_dim_spans_.size() > 0) {
-            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-                auto plist_len_a = inverted_index_ids_spans_[a.first].size();
-                auto plist_len_b = inverted_index_ids_spans_[b.first].size();
-                float avg_a = plist_len_a > 0 ? score_sum_in_dim_spans_[a.first] / plist_len_a : 0.0f;
-                float avg_b = plist_len_b > 0 ? score_sum_in_dim_spans_[b.first] / plist_len_b : 0.0f;
-                float disc_a = (max_score_in_dim_spans_[a.first] - avg_a) * a.second;
-                float disc_b = (max_score_in_dim_spans_[b.first] - avg_b) * b.second;
-                return disc_a > disc_b;
-            });
+        if constexpr (use_dist_aware) {
+            // Distribution-aware term ordering: sort by discriminative power.
+            // Discriminative power = (max_score - avg_score) * query_weight
+            // A term with high max_score but low avg_score is more discriminative and helps
+            // establish a tighter threshold early, enabling more aggressive pruning.
+            if (score_sum_in_dim_spans_.size() > 0) {
+                std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                    auto plist_len_a = inverted_index_ids_spans_[a.first].size();
+                    auto plist_len_b = inverted_index_ids_spans_[b.first].size();
+                    float avg_a = plist_len_a > 0 ? score_sum_in_dim_spans_[a.first] / plist_len_a : 0.0f;
+                    float avg_b = plist_len_b > 0 ? score_sum_in_dim_spans_[b.first] / plist_len_b : 0.0f;
+                    float disc_a = (max_score_in_dim_spans_[a.first] - avg_a) * a.second;
+                    float disc_b = (max_score_in_dim_spans_[b.first] - avg_b) * b.second;
+                    return disc_a > disc_b;
+                });
+            } else {
+                // Fallback if score_sum not available
+                std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+                    return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
+                });
+            }
         } else {
-            // Fallback for older indexes without score_sum_in_dim_
+            // Original MaxScore: sort by max_score * query_weight
             std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
                 return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
             });
@@ -1591,10 +1599,11 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         if constexpr (algo == InvertedIndexAlgo::DAAT_WAND) {
             search_daat_wand(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE) {
-            search_daat_maxscore(q_vec, heap, filter, computer, dim_max_score_ratio);
+            // V1: Original MaxScore with max_score * query_weight sorting
+            search_daat_maxscore<false>(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else if constexpr (algo == InvertedIndexAlgo::DAAT_MAXSCORE_V2) {
-            // V2 uses SIMD batch processing with distribution-aware term ordering
-            search_daat_maxscore_v2(q_vec, heap, filter, computer, dim_max_score_ratio);
+            // V2: MaxScore with distribution-aware term ordering
+            search_daat_maxscore<true>(q_vec, heap, filter, computer, dim_max_score_ratio);
         } else {
             search_taat_naive(q_vec, heap, filter, computer);
         }
