@@ -75,3 +75,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
 else()
     message(STATUS "Skipping sparse SIMD benchmark on ${CMAKE_SYSTEM_PROCESSOR} (x86_64 only)")
 endif()
+
+# Ordering formula experiment (standalone, no HDF5 required)
+add_executable(experiment_ordering experiment_ordering.cpp)
+target_link_libraries(experiment_ordering atomic)
+install(TARGETS experiment_ordering DESTINATION unittest)
