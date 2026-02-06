@@ -1312,27 +1312,10 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     void
     search_daat_maxscore(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, DocIdFilter& filter,
                          const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
-        // Distribution-aware term ordering: sort by discriminative power rather than just max_score.
-        // Discriminative power = (max_score - avg_score) * query_weight
-        // A term with high max_score but low avg_score is more discriminative and helps
-        // establish a tight threshold faster, enabling more aggressive pruning.
-        if (score_sum_in_dim_spans_.size() > 0) {
-            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-                auto plist_len_a = inverted_index_ids_spans_[a.first].size();
-                auto plist_len_b = inverted_index_ids_spans_[b.first].size();
-                // Avoid division by zero for empty posting lists
-                float avg_a = plist_len_a > 0 ? score_sum_in_dim_spans_[a.first] / plist_len_a : 0.0f;
-                float avg_b = plist_len_b > 0 ? score_sum_in_dim_spans_[b.first] / plist_len_b : 0.0f;
-                float disc_a = (max_score_in_dim_spans_[a.first] - avg_a) * a.second;
-                float disc_b = (max_score_in_dim_spans_[b.first] - avg_b) * b.second;
-                return disc_a > disc_b;
-            });
-        } else {
-            // Fallback for older indexes without score_sum_in_dim_
-            std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
-                return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
-            });
-        }
+        // Original V1: sort by max_score * query_weight (descending)
+        std::sort(q_vec.begin(), q_vec.end(), [this](auto& a, auto& b) {
+            return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
+        });
 
         std::vector<Cursor<DocIdFilter>> cursors = make_cursors(q_vec, computer, filter, dim_max_score_ratio);
 

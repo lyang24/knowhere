@@ -6,7 +6,8 @@
       "Bash(ssh-keyscan:*)",
       "Bash(~/.ssh/known_hosts)",
       "WebFetch(domain:big-ann-benchmarks.com)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(cmake:*)"
     ]
   }
 }
