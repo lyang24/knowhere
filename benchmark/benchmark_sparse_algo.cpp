@@ -181,6 +181,7 @@ int
 main(int argc, char** argv) {
     std::string data_dir;
     std::string data_type;
+    std::string algo_filter;  // empty = all, or specific algo name
     int64_t topk = 10;
     int64_t nq = 0;  // 0 = use all queries
 
@@ -190,6 +191,8 @@ main(int argc, char** argv) {
             data_dir = argv[++i];
         } else if (strcmp(argv[i], "--data-type") == 0 && i + 1 < argc) {
             data_type = argv[++i];
+        } else if (strcmp(argv[i], "--algo") == 0 && i + 1 < argc) {
+            algo_filter = argv[++i];
         } else if (strcmp(argv[i], "--topk") == 0 && i + 1 < argc) {
             topk = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--nq") == 0 && i + 1 < argc) {
@@ -255,8 +258,21 @@ main(int argc, char** argv) {
         printf("\n  Computed avgdl: %.2f\n", avgdl);
     }
 
+    // Free CSR data — no longer needed after SparseRow conversion and avgdl computation
+    base.indptr.clear();
+    base.indptr.shrink_to_fit();
+    base.indices.clear();
+    base.indices.shrink_to_fit();
+    base.data.clear();
+    base.data.shrink_to_fit();
+
     // Algorithms to benchmark
-    std::vector<std::string> algos = {"DAAT_MAXSCORE", "DAAT_MAXSCORE_V2", "DSP"};
+    std::vector<std::string> algos;
+    if (algo_filter.empty()) {
+        algos = {"DAAT_MAXSCORE", "DAAT_MAXSCORE_V2", "DSP"};
+    } else {
+        algos = {algo_filter};
+    }
 
     // Metrics to benchmark based on data type
     std::vector<std::string> metrics;
