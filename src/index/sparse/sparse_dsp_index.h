@@ -418,11 +418,14 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
         // Free inverted index posting lists — DSP search uses only the forward index
         // and max_score_in_dim. Follows reference implementation which discards posting
         // lists after building block max + forward index metadata.
-        for (size_t i = 0; i < this->inverted_index_ids_.size(); ++i) {
-            this->inverted_index_ids_[i].clear();
-            this->inverted_index_ids_[i].shrink_to_fit();
-            this->inverted_index_vals_[i].clear();
-            this->inverted_index_vals_[i].shrink_to_fit();
+        // Only possible for non-mmapped mode (mmapped data is externally owned).
+        if constexpr (!mmapped) {
+            for (size_t i = 0; i < this->inverted_index_ids_.size(); ++i) {
+                this->inverted_index_ids_[i].clear();
+                this->inverted_index_ids_[i].shrink_to_fit();
+                this->inverted_index_vals_[i].clear();
+                this->inverted_index_vals_[i].shrink_to_fit();
+            }
         }
         this->inverted_index_ids_spans_.clear();
         this->inverted_index_vals_spans_.clear();
