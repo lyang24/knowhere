@@ -148,13 +148,14 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
         const uint32_t nr_dims = this->nr_inner_dims_;
         const bool is_bm25 = this->metric_type_ == SparseMetricType::METRIC_BM25;
 
-        // ---- Phase 1: Scan posting lists, compute block max + forward index entries ----
-        struct FwdEntry {
+        // ---- Phase 1: Scan posting lists, compute block max + per-doc forward index ----
+        // Per-doc forward index: (inner_dim, score) pairs appended per doc.
+        // This avoids a giant "collectors" array — follows reference implementation pattern.
+        struct DocFwdEntry {
             uint32_t inner_dim;
-            uint8_t doc_offset;
             float score;
         };
-        std::vector<std::vector<FwdEntry>> collectors(n_subblocks_);
+        std::vector<std::vector<DocFwdEntry>> per_doc_fwd(this->n_rows_internal_);
 
         // Temporary dense float block max per dim (reused)
         std::vector<float> tmp_sb_max(n_subblocks_, 0.0f);
@@ -234,8 +235,8 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
                 }
                 tmp_spb_max[spb] = std::max(tmp_spb_max[spb], score);
 
-                // Collect forward index entry
-                collectors[sb].push_back({d, static_cast<uint8_t>(doc_id % kSubblockSize), score});
+                // Append to per-doc forward index
+                per_doc_fwd[doc_id].push_back({d, score});
             }
 
             // ---- Store kth scores as u8 ----
@@ -312,21 +313,53 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
             }
         }
 
-        // ---- Phase 3: Build flat forward index ----
+        // ---- Phase 3: Build flat forward index from per-doc data ----
+        // Process one subblock at a time: collect entries from its docs, sort by dim,
+        // then emit flat forward index arrays. Frees per-doc data as we go.
         {
+            // Sort each doc's entries by dim (needed for two-pointer merge during search)
+            for (uint32_t doc = 0; doc < this->n_rows_internal_; ++doc) {
+                auto& entries = per_doc_fwd[doc];
+                if (entries.size() > 1) {
+                    std::sort(entries.begin(), entries.end(),
+                              [](const DocFwdEntry& a, const DocFwdEntry& b) { return a.inner_dim < b.inner_dim; });
+                }
+            }
+
+            // Two-pass: first count, then fill
             uint32_t total_terms = 0;
             uint32_t total_entries = 0;
+
+            // Temporary buffer for collecting block entries
+            struct BlockEntry {
+                uint32_t inner_dim;
+                uint8_t doc_offset;
+                float score;
+            };
+            std::vector<BlockEntry> block_buf;
+            block_buf.reserve(1024);
+
+            // Pass 1: count terms and entries per subblock
             for (uint32_t sb = 0; sb < n_subblocks_; ++sb) {
-                auto& entries = collectors[sb];
-                if (entries.empty())
+                block_buf.clear();
+                const uint32_t doc_start = sb * kSubblockSize;
+                const uint32_t doc_end =
+                    std::min(doc_start + kSubblockSize, static_cast<uint32_t>(this->n_rows_internal_));
+                for (uint32_t doc = doc_start; doc < doc_end; ++doc) {
+                    const uint8_t doc_off = static_cast<uint8_t>(doc - doc_start);
+                    for (const auto& e : per_doc_fwd[doc]) {
+                        block_buf.push_back({e.inner_dim, doc_off, e.score});
+                    }
+                }
+                if (block_buf.empty())
                     continue;
-                std::sort(entries.begin(), entries.end(), [](const FwdEntry& a, const FwdEntry& b) {
+                std::sort(block_buf.begin(), block_buf.end(), [](const BlockEntry& a, const BlockEntry& b) {
                     return a.inner_dim < b.inner_dim || (a.inner_dim == b.inner_dim && a.doc_offset < b.doc_offset);
                 });
-                total_entries += entries.size();
+                total_entries += block_buf.size();
                 total_terms++;
-                for (size_t i = 1; i < entries.size(); ++i) {
-                    if (entries[i].inner_dim != entries[i - 1].inner_dim) {
+                for (size_t i = 1; i < block_buf.size(); ++i) {
+                    if (block_buf[i].inner_dim != block_buf[i - 1].inner_dim) {
                         total_terms++;
                     }
                 }
@@ -341,23 +374,39 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
             uint32_t term_pos = 0;
             uint32_t entry_pos = 0;
 
+            // Pass 2: fill flat arrays and free per-doc data
             for (uint32_t sb = 0; sb < n_subblocks_; ++sb) {
                 fwd_block_term_offsets_[sb] = term_pos;
-                const auto& entries = collectors[sb];
-                if (entries.empty())
+                block_buf.clear();
+                const uint32_t doc_start = sb * kSubblockSize;
+                const uint32_t doc_end =
+                    std::min(doc_start + kSubblockSize, static_cast<uint32_t>(this->n_rows_internal_));
+                for (uint32_t doc = doc_start; doc < doc_end; ++doc) {
+                    const uint8_t doc_off = static_cast<uint8_t>(doc - doc_start);
+                    for (const auto& e : per_doc_fwd[doc]) {
+                        block_buf.push_back({e.inner_dim, doc_off, e.score});
+                    }
+                    // Free this doc's per-doc data
+                    per_doc_fwd[doc].clear();
+                    per_doc_fwd[doc].shrink_to_fit();
+                }
+                if (block_buf.empty())
                     continue;
+                std::sort(block_buf.begin(), block_buf.end(), [](const BlockEntry& a, const BlockEntry& b) {
+                    return a.inner_dim < b.inner_dim || (a.inner_dim == b.inner_dim && a.doc_offset < b.doc_offset);
+                });
 
-                fwd_term_ids_[term_pos] = entries[0].inner_dim;
+                fwd_term_ids_[term_pos] = block_buf[0].inner_dim;
                 fwd_term_entry_offsets_[term_pos] = entry_pos;
 
-                for (size_t i = 0; i < entries.size(); ++i) {
-                    if (i > 0 && entries[i].inner_dim != entries[i - 1].inner_dim) {
+                for (size_t i = 0; i < block_buf.size(); ++i) {
+                    if (i > 0 && block_buf[i].inner_dim != block_buf[i - 1].inner_dim) {
                         term_pos++;
-                        fwd_term_ids_[term_pos] = entries[i].inner_dim;
+                        fwd_term_ids_[term_pos] = block_buf[i].inner_dim;
                         fwd_term_entry_offsets_[term_pos] = entry_pos;
                     }
-                    fwd_doc_offsets_[entry_pos] = entries[i].doc_offset;
-                    fwd_scores_[entry_pos] = entries[i].score;
+                    fwd_doc_offsets_[entry_pos] = block_buf[i].doc_offset;
+                    fwd_scores_[entry_pos] = block_buf[i].score;
                     entry_pos++;
                 }
                 term_pos++;
