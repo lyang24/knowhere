@@ -282,9 +282,9 @@ main(int argc, char** argv) {
         metrics = {"BM25"};
     }
 
-    // 1 warmup run + 1 measured run
-    const int total_runs = 2;
-    const int warmup_runs = 1;
+    // Single run, no warmup
+    const int total_runs = 1;
+    const int warmup_runs = 0;
 
     printf("\n[Benchmark Configuration]\n");
     printf("  Base vectors: %ld\n", base.n_rows);
