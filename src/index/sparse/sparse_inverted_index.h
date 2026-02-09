@@ -950,7 +950,7 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
         return max_dim_;
     }
 
- private:
+ protected:
     // Given a vector of values, returns the threshold value.
     // All values strictly smaller than the threshold will be ignored.
     // values will be modified in this function.
@@ -1024,9 +1024,19 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
 
         void
         seek(table_t vec_id) {
+#ifdef SEEK_INSTRUMENTATION
+            size_t old_loc = loc_;
+#endif
             while (loc_ < plist_size_ && plist_ids_[loc_] < vec_id) {
                 ++loc_;
             }
+#ifdef SEEK_INSTRUMENTATION
+            g_seek_stats.record(loc_ - old_loc);
+            if (loc_ < plist_size_ && plist_ids_[loc_] == vec_id)
+                g_seek_stats.record_hit();
+            else
+                g_seek_stats.record_miss();
+#endif
             skip_filtered_ids();
             update_cur_vec_id();
         }

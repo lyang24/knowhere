@@ -234,20 +234,29 @@ main(int argc, char** argv) {
     }
     printf("  Using %ld queries\n", nq);
 
-    // Load ground truth
-    GroundTruth gt;
-    if (!gt.load(data_dir + "/base_small.dev.gt", queries.n_rows)) {
-        printf("Warning: Ground truth not loaded, recall will not be computed\n");
-    }
-
     // Convert to sparse rows
     printf("\n[Converting to SparseRow format]\n");
     auto base_rows = base.to_sparse_rows();
     auto query_rows = queries.to_sparse_rows();
     printf("  Done\n");
 
+    // Compute avgdl (average document length = average row sum) for BM25
+    double avgdl = 0.0;
+    if (data_type == "bm25") {
+        double total_len = 0.0;
+        for (int64_t i = 0; i < base.n_rows; ++i) {
+            int64_t start = base.indptr[i];
+            int64_t end = base.indptr[i + 1];
+            for (int64_t j = start; j < end; ++j) {
+                total_len += base.data[j];
+            }
+        }
+        avgdl = total_len / base.n_rows;
+        printf("\n  Computed avgdl: %.2f\n", avgdl);
+    }
+
     // Algorithms to benchmark
-    std::vector<std::string> algos = {"DAAT_MAXSCORE", "DAAT_MAXSCORE_V2"};
+    std::vector<std::string> algos = {"DAAT_MAXSCORE", "DAAT_MAXSCORE_V2", "DSP"};
 
     // Metrics to benchmark based on data type
     std::vector<std::string> metrics;
@@ -273,7 +282,24 @@ main(int argc, char** argv) {
         printf("  Metric: %s\n", metric.c_str());
         printf("==========================================================\n");
 
+        // Load metric-specific ground truth
+        // Try: base_small.dev.bm25.gt or base_small.dev.ip.gt first, then fall back to base_small.dev.gt
+        GroundTruth gt;
+        std::string metric_lower = metric;
+        std::transform(metric_lower.begin(), metric_lower.end(), metric_lower.begin(), ::tolower);
+        std::string gt_path = data_dir + "/base_small.dev." + metric_lower + ".gt";
+        if (!gt.load(gt_path, queries.n_rows)) {
+            gt_path = data_dir + "/base_small.dev.gt";
+            if (!gt.load(gt_path, queries.n_rows)) {
+                printf("Warning: Ground truth not loaded, recall will not be computed\n");
+            }
+        }
+
         for (const auto& algo : algos) {
+#ifdef SEEK_INSTRUMENTATION
+            knowhere::sparse::g_seek_stats.reset();
+            knowhere::sparse::g_dsp_stats.reset();
+#endif
             printf("\n----------------------------------------------------------\n");
             printf("  Algorithm: %s (%s)\n", algo.c_str(), metric.c_str());
             printf("----------------------------------------------------------\n");
@@ -296,7 +322,7 @@ main(int argc, char** argv) {
             if (metric == "BM25") {
                 build_conf["bm25_k1"] = 1.2f;
                 build_conf["bm25_b"] = 0.75f;
-                build_conf["bm25_avgdl"] = 100.0f;
+                build_conf["bm25_avgdl"] = static_cast<float>(avgdl);
             }
 
             // Create dataset
@@ -321,7 +347,7 @@ main(int argc, char** argv) {
             if (metric == "BM25") {
                 search_conf["bm25_k1"] = 1.2f;
                 search_conf["bm25_b"] = 0.75f;
-                search_conf["bm25_avgdl"] = 100.0f;
+                search_conf["bm25_avgdl"] = static_cast<float>(avgdl);
             }
 
             // Pre-allocate reusable query dataset to avoid per-query allocation overhead
@@ -404,6 +430,10 @@ main(int argc, char** argv) {
                 }
             }
             printf("\n");
+#ifdef SEEK_INSTRUMENTATION
+            knowhere::sparse::g_seek_stats.print(algo.c_str());
+            knowhere::sparse::g_dsp_stats.print(algo.c_str());
+#endif
         }
     }
 
