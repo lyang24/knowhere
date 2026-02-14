@@ -18,6 +18,7 @@
 
 #include <boost/core/span.hpp>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -1495,6 +1496,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
     }
 
     // IP path: SIMD batch accumulation with window-based processing
+    // Processes documents in fixed-size windows to bound memory usage and improve cache efficiency.
+    // Score buffer is O(WINDOW_SIZE) instead of O(n_docs), fitting in L2 cache for fast gather/scatter.
     template <typename DocIdFilter>
     void
     search_daat_maxscore_v2_ip(std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap,
@@ -1505,12 +1508,12 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
             return a.second * max_score_in_dim_spans_[a.first] > b.second * max_score_in_dim_spans_[b.first];
         });
 
-        // Build posting list info for each query term
         struct PostingListInfo {
             float q_weight;
             float max_score;
-            boost::span<const table_t> ids;
-            boost::span<const QType> vals;
+            const table_t* ids;
+            const QType* vals;
+            size_t size;
         };
         std::vector<PostingListInfo> posting_lists;
         posting_lists.reserve(q_vec.size());
@@ -1522,7 +1525,8 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
                 continue;
 
             float max_score = max_score_in_dim_spans_[inner_dim] * static_cast<float>(q_weight) * dim_max_score_ratio;
-            posting_lists.push_back({static_cast<float>(q_weight), max_score, plist_ids, plist_vals});
+            posting_lists.push_back(
+                {static_cast<float>(q_weight), max_score, plist_ids.data(), plist_vals.data(), plist_ids.size()});
         }
 
         if (posting_lists.empty())
@@ -1538,71 +1542,102 @@ class InvertedIndex : public BaseInvertedIndex<DType> {
 
         float threshold = heap.full() ? heap.top().val : 0;
 
-        // Allocate score buffer for all documents
-        std::vector<float> scores(n_rows_internal_, 0.0f);
+        // Window-based processing: 64K docs = 256KB score buffer, fits in L2 cache
+        constexpr uint32_t WINDOW_SIZE = 65536;
+        std::vector<float> scores(WINDOW_SIZE, 0.0f);
+        std::vector<uint32_t> candidate_indices(WINDOW_SIZE);
 
-        // Candidate indices buffer for SIMD extraction
-        std::vector<uint32_t> candidate_indices(n_rows_internal_);
+        // Per-posting-list position cursors for efficient sequential advancement
+        std::vector<size_t> pl_pos(posting_lists.size(), 0);
 
-        // Find essential/non-essential split based on current threshold
-        size_t first_ne_idx = posting_lists.size();
-        while (first_ne_idx > 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
-            --first_ne_idx;
-        }
-        if (first_ne_idx == 0)
-            return;  // No candidates possible
+        const auto n_rows = static_cast<uint32_t>(n_rows_internal_);
 
-        // BATCH PROCESS each essential posting list with SIMD
-        for (size_t i = 0; i < first_ne_idx; ++i) {
-            auto& pl = posting_lists[i];
-            const table_t* ids = pl.ids.data();
-            const QType* vals = pl.vals.data();
-            size_t pl_size = pl.ids.size();
+        for (uint32_t w_start = 0; w_start < n_rows; w_start += WINDOW_SIZE) {
+            uint32_t w_end = std::min(w_start + WINDOW_SIZE, n_rows);
+            uint32_t w_size = w_end - w_start;
 
-            sparse::accumulate_window_ip_dispatch(ids, vals, 0, pl_size, pl.q_weight, scores.data(), 0);
-        }
+            // Recompute essential/non-essential split (threshold may have increased)
+            size_t first_ne_idx = posting_lists.size();
+            while (first_ne_idx > 0 && upper_bounds[first_ne_idx - 1] <= threshold) {
+                --first_ne_idx;
+            }
+            if (first_ne_idx == 0)
+                return;
 
-        // Calculate max possible contribution from non-essential terms
-        float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
-
-        // SIMD candidate extraction: find all docs where score > effective_threshold
-        float effective_threshold = std::max(0.0f, threshold - ne_upper_bound);
-        size_t num_candidates = sparse::extract_candidates_dispatch(scores.data(), n_rows_internal_,
-                                                                    effective_threshold, candidate_indices.data());
-
-        // Process extracted candidates
-        for (size_t c = 0; c < num_candidates; ++c) {
-            table_t doc_id = candidate_indices[c];
-            float score = scores[doc_id];
-
-            if (!filter.empty() && filter.test(doc_id))
-                continue;
-
-            // Add contributions from non-essential terms
-            float full_score = score;
-
-            for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
-                // Early termination if we can't beat threshold
-                if (full_score + upper_bounds[i] <= threshold)
-                    break;
-
+            // Accumulate essential posting lists for this window
+            bool any_accumulated = false;
+            for (size_t i = 0; i < first_ne_idx; ++i) {
                 auto& pl = posting_lists[i];
-                const table_t* ids = pl.ids.data();
-                const QType* vals = pl.vals.data();
-                size_t pl_size = pl.ids.size();
 
-                // Binary search for doc_id in this posting list
-                auto it = std::lower_bound(ids, ids + pl_size, doc_id);
-                if (it != ids + pl_size && *it == doc_id) {
-                    size_t idx = it - ids;
-                    full_score += pl.q_weight * computer(static_cast<float>(vals[idx]), 0);
+                // Advance cursor to first doc_id >= w_start
+                auto seg_begin = std::lower_bound(pl.ids + pl_pos[i], pl.ids + pl.size, w_start);
+                // Find first doc_id >= w_end
+                auto seg_end = std::lower_bound(seg_begin, pl.ids + pl.size, w_end);
+
+                size_t seg_start_idx = seg_begin - pl.ids;
+                size_t seg_end_idx = seg_end - pl.ids;
+
+                // Save cursor for next window
+                pl_pos[i] = seg_end_idx;
+
+                if (seg_start_idx < seg_end_idx) {
+                    size_t seg_size = seg_end_idx - seg_start_idx;
+                    // Contiguous segment: all doc_ids consecutive, use sequential load/FMA/store
+                    if (pl.ids[seg_end_idx - 1] - pl.ids[seg_start_idx] == seg_size - 1) {
+                        size_t offset = pl.ids[seg_start_idx] - w_start;
+                        const QType* v = pl.vals + seg_start_idx;
+                        float qw = pl.q_weight;
+                        for (size_t k = 0; k < seg_size; ++k) {
+                            scores[offset + k] += qw * static_cast<float>(v[k]);
+                        }
+                    } else {
+                        sparse::accumulate_window_ip_dispatch(pl.ids, pl.vals, seg_start_idx, seg_end_idx, pl.q_weight,
+                                                              scores.data(), w_start);
+                    }
+                    any_accumulated = true;
                 }
             }
 
-            if (full_score > threshold) {
-                heap.push(doc_id, full_score);
-                threshold = heap.full() ? heap.top().val : 0;
+            if (!any_accumulated)
+                continue;
+
+            // SIMD candidate extraction
+            float ne_upper_bound = (first_ne_idx < posting_lists.size()) ? upper_bounds[first_ne_idx] : 0.0f;
+            float effective_threshold = std::max(0.0f, threshold - ne_upper_bound);
+            size_t num_candidates = sparse::extract_candidates_dispatch(scores.data(), w_size, effective_threshold,
+                                                                        candidate_indices.data());
+
+            // Process extracted candidates
+            for (size_t c = 0; c < num_candidates; ++c) {
+                uint32_t local_id = candidate_indices[c];
+                table_t doc_id = w_start + local_id;
+                float score = scores[local_id];
+
+                if (!filter.empty() && filter.test(doc_id))
+                    continue;
+
+                // Add contributions from non-essential terms
+                float full_score = score;
+                for (size_t i = first_ne_idx; i < posting_lists.size(); ++i) {
+                    if (full_score + upper_bounds[i] <= threshold)
+                        break;
+
+                    auto& pl = posting_lists[i];
+                    auto it = std::lower_bound(pl.ids, pl.ids + pl.size, doc_id);
+                    if (it != pl.ids + pl.size && *it == doc_id) {
+                        size_t idx = it - pl.ids;
+                        full_score += pl.q_weight * computer(static_cast<float>(pl.vals[idx]), 0);
+                    }
+                }
+
+                if (full_score > threshold) {
+                    heap.push(doc_id, full_score);
+                    threshold = heap.full() ? heap.top().val : 0;
+                }
             }
+
+            // Zero score buffer for next window (only the used portion, cache-hot)
+            std::memset(scores.data(), 0, w_size * sizeof(float));
         }
     }
 
