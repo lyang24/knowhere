@@ -83,7 +83,8 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
 
         const size_t heap_capacity = k * approx_params.refine_factor;
         MaxMinHeap<float> heap(heap_capacity);
-        search_dsp(q_vec, heap, heap_capacity, bitset, computer, approx_params.dim_max_score_ratio);
+        search_dsp(q_vec, heap, heap_capacity, bitset, computer, approx_params.dim_max_score_ratio,
+                   approx_params.dsp_mu, approx_params.dsp_eta);
 
         if (approx_params.refine_factor == 1) {
             this->collect_result(heap, distances, labels);
@@ -108,11 +109,12 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
     std::vector<DimBlockMax> dim_block_max_;
 
     // ========================================================================
-    // Superblock max (sparse CSR format, float — used for coarse pruning)
+    // Superblock max + ASC (sparse CSR format, float — used for coarse pruning)
     // ========================================================================
     std::vector<uint32_t> spb_dim_offsets_;
     std::vector<uint32_t> spb_block_ids_;
     std::vector<float> spb_max_vals_;
+    std::vector<float> spb_asc_vals_;  // Average Segment Contribution per (dim, superblock)
 
     // ========================================================================
     // Forward index (flat layout for cache-friendly scoring)
@@ -130,6 +132,11 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
     // Dense threshold: if a posting list has non-zero blocks in more than
     // this fraction of total subblocks, store as dense u8 array.
     static constexpr float kDenseThreshold = 0.125f;  // 12.5%
+
+    // ASC (Average Segment Contribution): divide each superblock into segments.
+    // Track max score per segment, store mean of non-zero segment maxima.
+    static constexpr uint32_t kNumSegments = 8;
+    static constexpr uint32_t kSegmentSize = kSuperblockSize / kNumSegments;  // 64 docs
 
     // ========================================================================
     // Build DSP metadata from inverted index
@@ -169,10 +176,14 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
         std::vector<uint32_t> spb_touched_list;
         spb_touched_list.reserve(n_superblocks_);
 
+        // Segment max: for ASC computation (8 segments per superblock)
+        std::vector<float> tmp_seg_max(n_superblocks_ * kNumSegments, 0.0f);
+
         // Superblock CSR builders
         struct SpbEntry {
             uint32_t block_id;
             float max_score;
+            float asc;  // Average Segment Contribution
         };
         std::vector<std::vector<SpbEntry>> per_dim_spb(nr_dims);
 
@@ -235,6 +246,10 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
                 }
                 tmp_spb_max[spb] = std::max(tmp_spb_max[spb], score);
 
+                // Track segment max (for ASC)
+                const uint32_t seg = doc_id / kSegmentSize;
+                tmp_seg_max[seg] = std::max(tmp_seg_max[seg], score);
+
                 // Append to per-doc forward index
                 per_doc_fwd[doc_id].push_back({d, score});
             }
@@ -271,11 +286,22 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
                 }
             }
 
-            // ---- Collect superblock max into CSR ----
+            // ---- Collect superblock max + ASC into CSR ----
             std::sort(spb_touched_list.begin(), spb_touched_list.end());
             per_dim_spb[d].reserve(spb_touched_list.size());
             for (uint32_t spb : spb_touched_list) {
-                per_dim_spb[d].push_back({spb, tmp_spb_max[spb]});
+                // Compute ASC: mean of non-zero segment maxima within this superblock
+                float seg_sum = 0.0f;
+                uint32_t seg_count = 0;
+                for (uint32_t s = 0; s < kNumSegments; ++s) {
+                    float seg_max = tmp_seg_max[spb * kNumSegments + s];
+                    if (seg_max > 0.0f) {
+                        seg_sum += seg_max;
+                        seg_count++;
+                    }
+                }
+                float asc = (seg_count > 0) ? (seg_sum / seg_count) : 0.0f;
+                per_dim_spb[d].push_back({spb, tmp_spb_max[spb], asc});
             }
 
             // ---- Reset temp arrays ----
@@ -287,6 +313,10 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
             for (uint32_t spb : spb_touched_list) {
                 tmp_spb_max[spb] = 0.0f;
                 spb_touched[spb] = 0;
+                // Reset segment tracking for this superblock
+                for (uint32_t s = 0; s < kNumSegments; ++s) {
+                    tmp_seg_max[spb * kNumSegments + s] = 0.0f;
+                }
             }
             spb_touched_list.clear();
         }
@@ -303,11 +333,13 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
 
             spb_block_ids_.resize(total_spb);
             spb_max_vals_.resize(total_spb);
+            spb_asc_vals_.resize(total_spb);
             for (uint32_t d = 0; d < nr_dims; ++d) {
                 uint32_t off = spb_dim_offsets_[d];
                 for (const auto& e : per_dim_spb[d]) {
                     spb_block_ids_[off] = e.block_id;
                     spb_max_vals_[off] = e.max_score;
+                    spb_asc_vals_[off] = e.asc;
                     ++off;
                 }
             }
@@ -437,7 +469,8 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
     template <typename DocIdFilter>
     void
     search_dsp(const std::vector<std::pair<size_t, DType>>& q_vec, MaxMinHeap<float>& heap, size_t heap_capacity,
-               DocIdFilter& filter, const DocValueComputer<float>& computer, float dim_max_score_ratio) const {
+               DocIdFilter& filter, const DocValueComputer<float>& computer, float dim_max_score_ratio, float mu,
+               float eta) const {
 #ifdef SEEK_INSTRUMENTATION
         auto t0 = std::chrono::high_resolution_clock::now();
 #define DSP_TIMER_MARK(var) auto var = std::chrono::high_resolution_clock::now()
@@ -483,6 +516,7 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
 
         // ---- Step 2: Initialize threshold from kth scores ----
         float float_threshold = 0.0f;
+#ifndef DSP_DISABLE_KTH_INIT
         {
             // Select kth bucket based on k
             int kth_bucket = (heap_capacity > 10) + (heap_capacity > 100) + (heap_capacity > 1000);
@@ -496,27 +530,34 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
                 float_threshold = std::max(float_threshold, term_thresh);
             }
         }
+#endif
         uint16_t u16_threshold = static_cast<uint16_t>(std::min(65535.0f, float_threshold * score_scale));
 
         DSP_TIMER_MARK(t1);
-        // ---- Step 3: Superblock pruning (sparse float) ----
-        // Use actual UBs (no dim_ratio inflation) for tighter pruning
+        // ---- Step 3: Superblock pruning with ASC (sparse float) ----
+        // Compute both max UBs and ASC UBs per superblock
         std::vector<float> superblock_ub(n_superblocks_, 0.0f);
+        std::vector<float> superblock_asc(n_superblocks_, 0.0f);
         for (const auto& qt : query) {
             const float qw = qt.weight;
             const uint32_t start = spb_dim_offsets_[qt.inner_dim];
             const uint32_t end = spb_dim_offsets_[qt.inner_dim + 1];
             for (uint32_t i = start; i < end; ++i) {
                 superblock_ub[spb_block_ids_[i]] += qw * spb_max_vals_[i];
+                superblock_asc[spb_block_ids_[i]] += qw * spb_asc_vals_[i];
             }
         }
+
+        // Dual threshold check: keep if max exceeds mu-threshold OR asc exceeds eta-threshold
+        const float mu_threshold = (mu > 0.0f) ? float_threshold / mu : float_threshold;
+        const float eta_threshold = (eta > 0.0f) ? float_threshold / eta : float_threshold;
 
         // Collect surviving superblocks + build bitset
         std::vector<uint32_t> surviving_spb;
         surviving_spb.reserve(n_superblocks_);
         std::vector<uint8_t> spb_alive(n_superblocks_, 0);
         for (uint32_t spb = 0; spb < n_superblocks_; ++spb) {
-            if (superblock_ub[spb] > float_threshold) {
+            if (superblock_ub[spb] > mu_threshold || superblock_asc[spb] > eta_threshold) {
                 surviving_spb.push_back(spb);
                 spb_alive[spb] = 1;
             }
@@ -557,12 +598,20 @@ class DspIndex : public InvertedIndex<DType, QType, InvertedIndexAlgo::DAAT_MAXS
 
         DSP_TIMER_MARK(t3);
         // ---- Step 5: Collect candidates and counting sort by u16 UB ----
+        // SIMD fast-path: scan 64 u16 block UBs per superblock in 2 AVX-512 loads.
+        // If no block in the superblock exceeds threshold, skip entirely.
         std::vector<uint32_t> candidates;
         candidates.reserve(n_subblocks_ / 4);
         uint16_t max_ub = 0;
 
         for (uint32_t spb : surviving_spb) {
             const uint32_t sb_start = spb * kStride;
+            // SIMD scan: check if ANY of the 64 subblocks exceeds threshold
+            // block_ub is padded to n_sb_padded_ (multiple of kStride), safe to read kStride elements
+            if (!scan_block_ub_any_above_dispatch(block_ub.data() + sb_start, u16_threshold, kStride)) {
+                continue;
+            }
+            // At least one block above threshold — scalar collect
             const uint32_t sb_end = std::min(sb_start + kStride, n_subblocks_);
             for (uint32_t sb = sb_start; sb < sb_end; ++sb) {
                 if (block_ub[sb] > u16_threshold) {

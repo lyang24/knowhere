@@ -184,6 +184,8 @@ main(int argc, char** argv) {
     std::string algo_filter;  // empty = all, or specific algo name
     int64_t topk = 10;
     int64_t nq = 0;  // 0 = use all queries
+    float dsp_mu = 1.0f;
+    float dsp_eta = 1.0f;
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -197,6 +199,10 @@ main(int argc, char** argv) {
             topk = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--nq") == 0 && i + 1 < argc) {
             nq = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--mu") == 0 && i + 1 < argc) {
+            dsp_mu = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--eta") == 0 && i + 1 < argc) {
+            dsp_eta = atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -291,6 +297,9 @@ main(int argc, char** argv) {
     printf("  Queries: %ld\n", nq);
     printf("  Top-k: %ld\n", topk);
     printf("  Runs: %d (warmup: %d)\n", total_runs, warmup_runs);
+    if (dsp_mu != 1.0f || dsp_eta != 1.0f) {
+        printf("  DSP mu: %.2f, eta: %.2f\n", dsp_mu, dsp_eta);
+    }
 
     for (const auto& metric : metrics) {
         printf("\n==========================================================\n");
@@ -359,6 +368,8 @@ main(int argc, char** argv) {
             search_conf["metric_type"] = metric;
             search_conf["drop_ratio_search"] = 0.0f;
             search_conf["topk"] = topk;
+            search_conf["dsp_mu"] = dsp_mu;
+            search_conf["dsp_eta"] = dsp_eta;
             if (metric == "BM25") {
                 search_conf["bm25_k1"] = 1.2f;
                 search_conf["bm25_b"] = 0.75f;

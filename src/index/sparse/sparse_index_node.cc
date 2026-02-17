@@ -124,6 +124,8 @@ class SparseInvertedIndexNode : public IndexNode {
             .refine_factor = refine_factor,
             .drop_ratio_search = drop_ratio_search,
             .dim_max_score_ratio = dim_max_score_ratio,
+            .dsp_mu = cfg.dsp_mu.value_or(1.0f),
+            .dsp_eta = cfg.dsp_eta.value_or(1.0f),
         };
 
         auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());

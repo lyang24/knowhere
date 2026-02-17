@@ -72,6 +72,8 @@ struct InvertedIndexApproxSearchParams {
     int refine_factor;
     float drop_ratio_search;
     float dim_max_score_ratio;
+    float dsp_mu = 1.0f;   // superblock max-based threshold relaxation (lower = more aggressive pruning)
+    float dsp_eta = 1.0f;  // ASC probabilistic threshold (lower = more aggressive pruning)
 };
 
 template <typename T>

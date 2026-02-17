@@ -11,6 +11,12 @@
 namespace knowhere::sparse {
 
 #if defined(__x86_64__) || defined(_M_X64)
+// AVX512 BW: check if any of 64 u16 block UBs exceeds threshold.
+// Used for fast superblock-level skip in DSP candidate collection.
+// n must be exactly 64 (kStride). Caller guarantees padded memory.
+bool
+scan_block_ub_any_above_avx512(const uint16_t* block_ub, uint16_t threshold, uint32_t n);
+
 void
 accumulate_posting_list_ip_avx512(const uint32_t* doc_ids, const float* doc_vals, size_t list_size, float q_weight,
                                   float* scores);
@@ -37,6 +43,27 @@ extract_candidates_avx512(const float* scores, size_t window_size, float thresho
 void
 accumulate_block_ub_avx512(uint16_t* ub, const uint8_t* block_max, uint16_t query_weight, uint32_t n);
 #endif
+
+// Scalar fallback for SIMD block UB scan: check if any of n u16 values > threshold
+inline bool
+scan_block_ub_any_above_scalar(const uint16_t* block_ub, uint16_t threshold, uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (block_ub[i] > threshold)
+            return true;
+    }
+    return false;
+}
+
+// Dispatch for block UB scan with runtime CPU detection
+inline bool
+scan_block_ub_any_above_dispatch(const uint16_t* block_ub, uint16_t threshold, uint32_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (faiss::InstructionSet::GetInstance().AVX512BW()) {
+        return scan_block_ub_any_above_avx512(block_ub, threshold, n);
+    }
+#endif
+    return scan_block_ub_any_above_scalar(block_ub, threshold, n);
+}
 
 // Scalar fallback for u8 block max to u16 UB accumulation
 inline void

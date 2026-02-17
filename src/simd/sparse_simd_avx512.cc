@@ -14,9 +14,33 @@
 
 #include <immintrin.h>
 
+#include <cassert>
+
 #include "sparse_simd.h"
 
 namespace knowhere::sparse {
+
+// ============================================================================
+// AVX512 BW: Check if any of 64 u16 block UBs exceeds a threshold
+// ============================================================================
+// Loads 2 × 32 u16 values (one superblock's 64 subblocks), compares each
+// against threshold, and returns true if at least one exceeds it.
+// n must be exactly 64 (kStride). Caller guarantees block_ub is padded.
+bool
+scan_block_ub_any_above_avx512(const uint16_t* block_ub, uint16_t threshold, uint32_t n) {
+    assert(n == 64 && "scan_block_ub_any_above_avx512 expects exactly 64 elements");
+    (void)n;
+
+    const __m512i thresh_v = _mm512_set1_epi16(static_cast<int16_t>(threshold));
+
+    __m512i v0 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(block_ub));
+    __m512i v1 = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(block_ub + 32));
+
+    // Compare each lane: NLE = "not less-or-equal" = "greater than" for unsigned
+    __mmask32 mask =
+        _mm512_cmp_epu16_mask(v0, thresh_v, _MM_CMPINT_NLE) | _mm512_cmp_epu16_mask(v1, thresh_v, _MM_CMPINT_NLE);
+    return mask != 0;
+}
 
 // ============================================================================
 // Conflict Detection Configuration

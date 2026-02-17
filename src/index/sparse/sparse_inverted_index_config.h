@@ -23,6 +23,8 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_FLOAT drop_ratio_search;
     CFG_INT refine_factor;
     CFG_FLOAT dim_max_score_ratio;
+    CFG_FLOAT dsp_mu;
+    CFG_FLOAT dsp_eta;
     CFG_STRING inverted_index_algo;
     KNOHWERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
@@ -80,6 +82,16 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_range(0.5, 1.3)
             .set_default(1.05)
             .description("ratio to upscale/downscale the max score of each dimension")
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(dsp_mu)
+            .set_range(0.1, 2.0)
+            .set_default(1.0)
+            .description("DSP superblock max-based threshold relaxation factor")
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(dsp_eta)
+            .set_range(0.1, 2.0)
+            .set_default(1.0)
+            .description("DSP ASC probabilistic threshold factor")
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(inverted_index_algo)
             .description("inverted index algorithm")
