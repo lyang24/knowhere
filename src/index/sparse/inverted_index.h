@@ -12,6 +12,7 @@
 #include "index/sparse/searcher/block_max_maxscore.h"
 #include "index/sparse/searcher/block_max_wand.h"
 #include "index/sparse/searcher/daat_maxscore.h"
+#include "index/sparse/searcher/daat_maxscore_bulk.h"
 #include "index/sparse/searcher/daat_wand.h"
 #include "index/sparse/searcher/taat_naive.h"
 #include "io/memory_io.h"
@@ -32,6 +33,9 @@ enum class InvertedIndexAlgo : uint32_t {
     BLOCK_MAX_MAXSCORE = 3,
     BLOCK_MAX_WAND = 4,
     SINDI = 5,
+    // Experimental: windowed/bulk DAAT MaxScore. Uses the same on-disk metadata
+    // (max_score_per_dim_, row_sums_) as DAAT_MAXSCORE; query path only.
+    DAAT_MAXSCORE_BULK = 6,
 };
 
 enum class InvertedIndexEncoding : uint32_t {
@@ -609,6 +613,14 @@ CRTPInvertedIndex<IndexType, DType>::search(const SparseRow<DType>& query, size_
         }
         case InvertedIndexAlgo::DAAT_MAXSCORE: {
             DaatMaxScoreSearcher<std::remove_reference_t<IndexType>> searcher(
+                *static_cast<const IndexType*>(this), q_vec, search_scorer, k, this->nr_rows_, bitset,
+                search_params.approx.dim_max_score_ratio);
+            searcher.search();
+            process_search_results(searcher);
+            break;
+        }
+        case InvertedIndexAlgo::DAAT_MAXSCORE_BULK: {
+            DaatMaxScoreBulkSearcher<std::remove_reference_t<IndexType>> searcher(
                 *static_cast<const IndexType*>(this), q_vec, search_scorer, k, this->nr_rows_, bitset,
                 search_params.approx.dim_max_score_ratio);
             searcher.search();

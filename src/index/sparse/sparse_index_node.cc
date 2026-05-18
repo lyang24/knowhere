@@ -600,6 +600,7 @@ class SparseInvertedIndexNode : public IndexNode {
         auto algo_need_max_scores_per_dim = [&]() {
             return search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_WAND ||
                    search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE ||
+                   search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE_BULK ||
                    search_params.algo == sparse::inverted::InvertedIndexAlgo::BLOCK_MAX_MAXSCORE ||
                    search_params.algo == sparse::inverted::InvertedIndexAlgo::BLOCK_MAX_WAND;
         };
@@ -614,6 +615,8 @@ class SparseInvertedIndexNode : public IndexNode {
             search_params.algo = index_->get_build_algo();
         } else if (config.search_algo.value() == "DAAT_MAXSCORE") {
             search_params.algo = sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE;
+        } else if (config.search_algo.value() == "DAAT_MAXSCORE_BULK") {
+            search_params.algo = sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE_BULK;
         } else if (config.search_algo.value() == "DAAT_WAND") {
             search_params.algo = sparse::inverted::InvertedIndexAlgo::DAAT_WAND;
         } else if (config.search_algo.value() == "BLOCK_MAX_MAXSCORE") {
@@ -664,7 +667,8 @@ class SparseInvertedIndexNode : public IndexNode {
             search_params.scorer_config.scorer_params.bm25.b =
                 config.bm25_b.value_or(index_->get_scorer_config().scorer_params.bm25.b);
             if (search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_WAND ||
-                search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE) {
+                search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE ||
+                search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE_BULK) {
                 if (search_params.scorer_config.scorer_params.bm25.k1 !=
                         index_->get_scorer_config().scorer_params.bm25.k1 ||
                     search_params.scorer_config.scorer_params.bm25.b !=
