@@ -18,16 +18,21 @@
 //   turbopuffer's "vectorized MAXSCORE", and is the structural change needed
 //   before a real SIMD BM25 batch kernel can land.
 //
-// v1 scope (intentionally minimal):
+// v1.5 scope (intentionally minimal):
 //   - BM25 only. IP path is rejected at construction (cursors_ left empty so
 //     search() short-circuits); the caller should route IP queries to
 //     DaatMaxScoreSearcher.
-//   - No essential/non-essential pruning yet: every cursor is scanned over
-//     every window. This will visit strictly more (doc, term) pairs than
-//     production DAAT_MAXSCORE. The point of v1 is to measure whether the
-//     batched control flow itself is fast enough that adding pruning back in
-//     Stage B can win overall.
-//   - Fixed window size of 1024 docs (~4 KB scratch buffers, fits L1).
+//   - No essential/non-essential pruning yet: every cursor is scanned in
+//     every visited window. This will visit strictly more (doc, term) pairs
+//     than production DAAT_MAXSCORE. The point of v1 is to measure whether
+//     the batched control flow itself is fast enough that adding pruning
+//     back in Stage B can win overall.
+//   - Window size 1024 docs (~4 KB scratch buffers, fits L1).
+//   - Windows are *cursor-driven*: the outer loop jumps directly to the next
+//     vec_id present in some cursor, skipping empty doc-id regions. v1
+//     iterated 0..max_vec_id by W which paid an O(n_cursors) overhead per
+//     empty window and made the bulk searcher 80-90% slower than the
+//     alternating MaxScore on large sparse corpora.
 //   - dim_max_score_ratio currently unused (no pruning to scale).
 //   - Uses the same on-disk metadata as DAAT_MAXSCORE (max_score_per_dim_,
 //     row_sums_); no new build-time work required.
@@ -99,14 +104,42 @@ class DaatMaxScoreBulkSearcher : public RankedSearcher {
         alignas(64) std::array<float, kWindowSize> doc_norms{};
         alignas(64) std::array<uint8_t, kWindowSize> hit{};
 
-        for (uint32_t win_start = 0; win_start < max_vec_id_; win_start += kWindowSize) {
+        // Cursor-driven outer loop: start each window at the smallest vec_id
+        // any cursor is currently pointing at, so empty doc-id regions are
+        // skipped via the underlying iterators' next_geq instead of being
+        // visited one window at a time.
+        //
+        // After process_window returns, every cursor is at vec_id >= win_end
+        // (or invalid), so the next call to min_cursor_vec_id() either gives
+        // us the next non-empty window's anchor or signals exhaustion.
+        uint32_t next_candidate = min_cursor_vec_id();
+        while (next_candidate < max_vec_id_) {
+            const uint32_t win_start = next_candidate;
             const uint32_t win_end = std::min<uint32_t>(win_start + kWindowSize, max_vec_id_);
             const uint32_t win_len = win_end - win_start;
             process_window(win_start, win_end, win_len, scores, doc_norms, hit);
+            next_candidate = min_cursor_vec_id();
         }
     }
 
  private:
+    // Smallest vec_id any still-valid cursor currently points at, or
+    // max_vec_id_ if all cursors are exhausted. Used to anchor the next
+    // window so empty regions are skipped.
+    [[nodiscard]] uint32_t
+    min_cursor_vec_id() const noexcept {
+        uint32_t min_id = max_vec_id_;
+        for (const auto& cursor : cursors_) {
+            if (cursor.index_cursor.valid()) {
+                const uint32_t v = cursor.index_cursor.vec_id();
+                if (v < min_id) {
+                    min_id = v;
+                }
+            }
+        }
+        return min_id;
+    }
+
     void
     process_window(uint32_t win_start, uint32_t win_end, uint32_t win_len, std::array<float, kWindowSize>& scores,
                    std::array<float, kWindowSize>& doc_norms, std::array<uint8_t, kWindowSize>& hit) {
