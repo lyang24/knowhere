@@ -8,17 +8,93 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstddef>
 #include <memory>
 #include <numeric>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "index/sparse/scorer.h"
 #include "index/sparse/searcher/searcher.h"
 #include "knowhere/bitsetview.h"
 
 namespace knowhere::sparse::inverted {
+
+namespace detail {
+
+// Sum of BM25 contributions for `n` matching query terms at the same document.
+// Each contribution is qval_p1[i] * tf[i] / (tf[i] + doc_norm), where doc_norm
+// is per-doc (precomputed once outside) and qval_p1/tf are per-(term, doc).
+//
+// Scalar reference; auto-vectorization typically can't kick in because the
+// loop body has a division on a small dynamic trip count.
+inline float
+bm25_batch_contrib_scalar(const float* qval_p1s, const float* tfs, std::size_t n, float doc_norm) noexcept {
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        sum += qval_p1s[i] * tfs[i] / (tfs[i] + doc_norm);
+    }
+    return sum;
+}
+
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
+// AVX-512 kernel: 16 contributions per pass plus a masked tail. Compiled with
+// the AVX-512 target attribute so it can live in a non-AVX-512 translation unit.
+__attribute__((target("avx512f"))) inline float
+bm25_batch_contrib_avx512(const float* qval_p1s, const float* tfs, std::size_t n, float doc_norm) noexcept {
+    __m512 sum = _mm512_setzero_ps();
+    const __m512 dn = _mm512_set1_ps(doc_norm);
+    std::size_t i = 0;
+    while (i + 16 <= n) {
+        __m512 q = _mm512_loadu_ps(qval_p1s + i);
+        __m512 tf_v = _mm512_loadu_ps(tfs + i);
+        __m512 num = _mm512_mul_ps(q, tf_v);
+        __m512 den = _mm512_add_ps(tf_v, dn);
+        sum = _mm512_add_ps(sum, _mm512_div_ps(num, den));
+        i += 16;
+    }
+    const std::size_t tail = n - i;
+    if (tail > 0) {
+        const __mmask16 mask = static_cast<__mmask16>((1U << tail) - 1U);
+        __m512 q = _mm512_maskz_loadu_ps(mask, qval_p1s + i);
+        __m512 tf_v = _mm512_maskz_loadu_ps(mask, tfs + i);
+        __m512 num = _mm512_mul_ps(q, tf_v);
+        // den unused lanes get 1.0 so the masked div doesn't see /0 even though
+        // we mask the result anyway. Belt and suspenders.
+        __m512 den = _mm512_mask_add_ps(_mm512_set1_ps(1.0f), mask, tf_v, dn);
+        sum = _mm512_add_ps(sum, _mm512_maskz_div_ps(mask, num, den));
+    }
+    return _mm512_reduce_add_ps(sum);
+}
+#endif
+
+// Dispatch. Uses AVX-512 when the host supports it and the trip count is large
+// enough to amortize the horizontal reduce. The threshold (n >= 4) is a guess
+// to tune empirically: below it scalar division latency wins; above it the
+// SIMD div throughput dominates.
+inline float
+bm25_batch_contrib(const float* qval_p1s, const float* tfs, std::size_t n, float doc_norm) noexcept {
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
+    static const bool has_avx512 = __builtin_cpu_supports("avx512f");
+    if (has_avx512 && n >= 4) {
+        return bm25_batch_contrib_avx512(qval_p1s, tfs, n, doc_norm);
+    }
+#endif
+    return bm25_batch_contrib_scalar(qval_p1s, tfs, n, doc_norm);
+}
+
+// Maximum essential matches collected in SoA buffers per doc. Real BM25 queries
+// rarely exceed 30-50 terms; any overflow is scalar-scored as a fallback so
+// correctness is preserved even on pathological inputs.
+constexpr std::size_t kSimdBatchCap = 64;
+
+}  // namespace detail
 
 template <typename IndexType>
 class DaatMaxScoreSearcher : public RankedSearcher {
@@ -162,20 +238,47 @@ class DaatMaxScoreSearcher : public RankedSearcher {
                     }
                 };
 
-                std::for_each(cursors.begin(), first_lookup, [&](auto& cursor) {
-                    if (cursor.vec_id() == current_vec_id) {
-                        current_score += score_term(cursor);
-                        cursor.next();
-                        if constexpr (ScorerType == IndexScorerType::BM25) {
-                            // Prefetch row_sums_ for next iterations that will be used by the BM25 scorer
-                            // Experiments show this prefetch pattern is optimal vs only prefetching next_vec_id
+                // Essential pass. For BM25, collect matching (qval_p1, tf) pairs
+                // into stack SoA so the per-(term, doc) divisions can be issued
+                // as a single SIMD batch instead of a chain of scalar divs. For
+                // IP we keep the scalar accumulation.
+                if constexpr (ScorerType == IndexScorerType::BM25) {
+                    std::array<float, detail::kSimdBatchCap> tf_buf;
+                    std::array<float, detail::kSimdBatchCap> qval_p1_buf;
+                    std::size_t n_matches = 0;
+                    std::for_each(cursors.begin(), first_lookup, [&](auto& cursor) {
+                        if (cursor.vec_id() == current_vec_id) {
+                            if (n_matches < detail::kSimdBatchCap) [[likely]] {
+                                tf_buf[n_matches] = static_cast<float>(cursor.index_cursor.val());
+                                qval_p1_buf[n_matches] = cursor.qval_p1;
+                                ++n_matches;
+                            } else {
+                                // Overflow path: extra essential matches at one doc beyond the
+                                // batch cap are scored scalar to keep correctness.
+                                current_score += score_term(cursor);
+                            }
+                            cursor.next();
                             __builtin_prefetch(&row_sums_[cursor.vec_id()], 0, 3);
                         }
+                        if (auto vec_id = cursor.vec_id(); vec_id < next_vec_id) {
+                            next_vec_id = vec_id;
+                        }
+                    });
+                    if (n_matches > 0) {
+                        current_score +=
+                            detail::bm25_batch_contrib(qval_p1_buf.data(), tf_buf.data(), n_matches, doc_norm);
                     }
-                    if (auto vec_id = cursor.vec_id(); vec_id < next_vec_id) {
-                        next_vec_id = vec_id;
-                    }
-                });
+                } else {
+                    std::for_each(cursors.begin(), first_lookup, [&](auto& cursor) {
+                        if (cursor.vec_id() == current_vec_id) {
+                            current_score += score_term(cursor);
+                            cursor.next();
+                        }
+                        if (auto vec_id = cursor.vec_id(); vec_id < next_vec_id) {
+                            next_vec_id = vec_id;
+                        }
+                    });
+                }
 
                 status = VectorStatus::Insert;
                 auto lookup_bound = first_upper_bound;
