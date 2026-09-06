@@ -37,7 +37,7 @@ namespace knowhere {
 expected<DataSetPtr>
 IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
                        milvus::OpContext* op_context) const {
-    const auto base_cfg = static_cast<const BaseConfig&>(*cfg);
+    const auto& base_cfg = static_cast<const BaseConfig&>(*cfg);
     const float closer_bound = base_cfg.range_filter.value();
     const bool has_closer_bound = closer_bound != defaultRangeFilter;
     float further_bound = base_cfg.radius.value();
@@ -69,6 +69,11 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
         return GenResultDataSet(nq, std::move(range_search_result));
     }
 
+    // AnnIterator takes ownership of cfg, so retain every value needed after the call before moving it.
+    const bool retain_iterator_order = base_cfg.retain_iterator_order.value();
+    const auto range_search_level = base_cfg.range_search_level.value();  // from 0 to 0.5
+    const float initial_further_bound = base_cfg.radius.value();
+
     // The range_search function has utilized the search_pool to concurrently handle various queries.
     // To prevent potential deadlocks, the iterator for a single query no longer requires additional thread
     //   control over the next() call.
@@ -85,7 +90,6 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
     std::vector<Status> task_status(nq, Status::success);
     std::vector<std::string> task_msg(nq);
 
-    const bool retain_iterator_order = base_cfg.retain_iterator_order.value();
     LOG_KNOWHERE_DEBUG_ << "retain_iterator_order: " << retain_iterator_order;
 
     /**
@@ -138,7 +142,6 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
      * - terminate iterator if next distance [consecutively] exceeds `further_bound` several times.
      * - if get enough results (`range_search_k`), update a `tighter_further_bound`, to early terminate iterator.
      * */
-    const auto range_search_level = base_cfg.range_search_level.value();  // from 0 to 0.5
     LOG_KNOWHERE_DEBUG_ << "range_search_level: " << range_search_level;
     auto task_with_unordered_iterator = [&](size_t idx) {
 #if defined(NOT_COMPILE_FOR_SWIG)
@@ -150,7 +153,7 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
         auto it = its[idx];
         size_t num_next = 0;
         size_t num_consecutive_over_further_bound = 0;
-        float tighter_further_bound = base_cfg.radius.value();
+        float tighter_further_bound = initial_further_bound;
         auto same_or_too_far = [&is_first_closer, &tighter_further_bound](float dist) {
             return !is_first_closer(dist, tighter_further_bound);
         };
@@ -274,7 +277,7 @@ IndexNode::SearchEmbList(const DataSetPtr dataset, std::unique_ptr<Config> cfg, 
 expected<DataSetPtr>
 IndexNode::SearchEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Config> config, const BitsetView& bitset,
                                milvus::OpContext* op_context) const {
-    auto cfg = static_cast<const knowhere::BaseConfig&>(*config);
+    const auto& cfg = static_cast<const knowhere::BaseConfig&>(*config);
     auto el_metric_type_or = get_el_metric_type(cfg.metric_type.value());
     auto metric_is_emb_list = el_metric_type_or.has_value();
     bool query_is_emb_list = dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET) != nullptr;
@@ -300,7 +303,7 @@ IndexNode::SearchEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Config>
 expected<DataSetPtr>
 IndexNode::RangeSearchEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
                                     milvus::OpContext* op_context) const {
-    auto config = static_cast<const knowhere::BaseConfig&>(*cfg);
+    const auto& config = static_cast<const knowhere::BaseConfig&>(*cfg);
     auto el_metric_type_or = get_el_metric_type(config.metric_type.value());
     auto metric_is_emb_list = el_metric_type_or.has_value();
     if (metric_is_emb_list) {
@@ -313,7 +316,7 @@ IndexNode::RangeSearchEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Co
 expected<std::vector<IndexNode::IteratorPtr>>
 IndexNode::AnnIteratorEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
                                     bool use_knowhere_search_pool, milvus::OpContext* op_context) const {
-    auto config = static_cast<const knowhere::BaseConfig&>(*cfg);
+    const auto& config = static_cast<const knowhere::BaseConfig&>(*cfg);
     auto el_metric_type_or = get_el_metric_type(config.metric_type.value());
     auto metric_is_emb_list = el_metric_type_or.has_value();
     if (metric_is_emb_list) {

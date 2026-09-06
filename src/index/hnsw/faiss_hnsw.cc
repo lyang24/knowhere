@@ -1359,7 +1359,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         const auto rows = dataset->GetRows();
         const auto* data = dataset->GetTensor();
 
-        const auto hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
+        const auto& hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
         const auto k = hnsw_cfg.k.value();
 
         BitsetView bitset(bitset_);
@@ -1660,7 +1660,7 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         const auto rows = dataset->GetRows();
         const auto* data = dataset->GetTensor();
 
-        const auto hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
+        const auto& hnsw_cfg = static_cast<const FaissHnswConfig&>(*cfg);
         BitsetView bitset(bitset_);
         auto index_id = getIndexToSearchByScalarInfo(bitset);
         if (index_id < 0) {
